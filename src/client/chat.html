@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>ModPilot</title>
+    <link rel="stylesheet" href="./chat.css" />
+  </head>
+  <body>
+    <noscript style="display:block;padding:16px;background:#7f1d1d;color:#fff;font:13px sans-serif;">
+      ModPilot needs JavaScript enabled.
+    </noscript>
+    <div class="app">
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-head">
+          <div class="brand">
+            <div class="brand-dot"></div>
+            <div>
+              <div class="brand-name">ModPilot</div>
+              <div class="brand-sub" id="sub-label">…</div>
+            </div>
+          </div>
+          <button class="icon-btn" id="toggle-sidebar" title="Hide sidebar" aria-label="Hide sidebar">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 6l-6 6 6 6"/></svg>
+          </button>
+        </div>
+        <button class="primary new-chat" id="new-chat">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 5v14M5 12h14"/></svg>
+          New chat
+        </button>
+        <div class="session-list" id="session-list"></div>
+        <div class="sidebar-foot">
+          <div class="user-chip" id="user-chip">u/—</div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <button class="icon-btn show-sidebar" id="show-sidebar" title="Show sidebar" aria-label="Show sidebar" hidden>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg>
+          </button>
+          <div class="topbar-title" id="topbar-title">New chat</div>
+          <div class="topbar-status" id="topbar-status"></div>
+        </header>
+
+        <section class="pane chat-pane active" id="pane-chat">
+          <div class="messages" id="messages">
+            <div class="welcome">
+              <div class="welcome-emoji">⌘</div>
+              <h2>ModPilot</h2>
+              <p>Tell me what you want done. I'll read the subreddit, plan, and act with your approval.</p>
+              <div class="examples">
+                <button class="example">Show me reposts flagged in the last 24h.</button>
+                <button class="example">Find new accounts (&lt;7d old) that posted in the last 12h. Don't ban — just list them.</button>
+                <button class="example">Audit u/automod's last 50 actions. Anything unusual?</button>
+                <button class="example">Summarize the top thread on the front page right now.</button>
+              </div>
+            </div>
+          </div>
+
+          <form class="composer" id="composer" autocomplete="off">
+            <div class="slash-palette" id="slash-palette" hidden></div>
+            <div class="approval-bar" id="approval-bar" hidden></div>
+            <div class="composer-input-row">
+              <textarea
+                id="input"
+                placeholder="Ask ModPilot anything about r/… — type / for commands"
+                rows="1"
+                maxlength="4000"
+              ></textarea>
+              <button class="send" id="send" type="submit" disabled>
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+              </button>
+            </div>
+            <div class="composer-foot">
+              <button type="button" class="mode-chip manual" id="mode-chip" title="Toggle approval mode (or type /auto, /manual)">
+                <span class="mode-dot"></span><span class="mode-label">Manual approval</span>
+              </button>
+              <span class="composer-hint">Enter to send · / for commands</span>
+            </div>
+          </form>
+        </section>
+
+      </main>
+    </div>
+
+    <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+    <div class="toast" id="toast"></div>
+    <script type="module" src="./chat.js"></script>
+  </body>
+</html>

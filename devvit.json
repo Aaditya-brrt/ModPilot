@@ -1,0 +1,133 @@
+{
+  "$schema": "https://developers.reddit.com/schema/config-file.v1.json",
+  "name": "tesmoddapp",
+  "server": {
+    "dir": "dist/server",
+    "entry": "index.cjs"
+  },
+  "post": {
+    "dir": "src/client",
+    "entrypoints": {
+      "default": {
+        "entry": "chat.html",
+        "height": "tall"
+      }
+    }
+  },
+  "menu": {
+    "items": [
+      {
+        "label": "Open ModPilot",
+        "description": "Open the ModPilot chat: a natural-language mod copilot powered by Gemini.",
+        "location": "subreddit",
+        "forUserType": "moderator",
+        "endpoint": "/internal/menu/open-modpilot"
+      },
+      {
+        "label": "Check this post for reposts",
+        "description": "Run ModPilot repost detection against this post on demand.",
+        "location": "post",
+        "forUserType": "moderator",
+        "endpoint": "/internal/menu/check-post"
+      },
+      {
+        "label": "Seed test posts (dev only)",
+        "description": "Seed ~20 posts across all categories ModPilot can handle: reposts, spam, caps violations, low-effort, engagement bait, self-promo, inflammatory tone, untagged spoilers, drama.",
+        "location": "subreddit",
+        "forUserType": "moderator",
+        "endpoint": "/internal/menu/seed-test-posts"
+      },
+      {
+        "label": "Mop comments",
+        "description": "Remove this comment and all child comments. This might take a few seconds to run.",
+        "location": "comment",
+        "forUserType": "moderator",
+        "endpoint": "/internal/menu/mop-comment"
+      },
+      {
+        "label": "Mop post comments",
+        "description": "Remove all comments of this post. This might take a few seconds to run.",
+        "location": "post",
+        "forUserType": "moderator",
+        "endpoint": "/internal/menu/mop-post"
+      }
+    ]
+  },
+  "forms": {
+    "mopComment": "/internal/form/mop-comment-submit",
+    "mopPost": "/internal/form/mop-post-submit"
+  },
+  "triggers": {
+    "onAppInstall": "/internal/triggers/on-app-install",
+    "onPostCreate": "/internal/triggers/on-post-create",
+    "onPostDelete": "/internal/triggers/on-post-delete"
+  },
+  "scheduler": {
+    "tasks": {
+      "modpilot-repost-cleanup": {
+        "endpoint": "/internal/jobs/cleanup",
+        "cron": "0 3 * * *"
+      }
+    }
+  },
+  "settings": {
+    "global": {
+      "geminiApiKey": {
+        "type": "string",
+        "label": "Gemini API key",
+        "helpText": "Free key from https://aistudio.google.com/apikey",
+        "isSecret": true
+      }
+    },
+    "subreddit": {
+      "similarityThreshold": {
+        "type": "number",
+        "label": "Repost similarity threshold (0-100)",
+        "helpText": "Posts scoring at or above this percentage are flagged. 85 is a balanced default.",
+        "defaultValue": 85
+      },
+      "autoCommentEnabled": {
+        "type": "boolean",
+        "label": "Auto-comment with link to the original",
+        "helpText": "When on, the app replies under flagged posts with a link to what it matched.",
+        "defaultValue": true
+      },
+      "autoReportEnabled": {
+        "type": "boolean",
+        "label": "Auto-report flagged posts to modqueue",
+        "helpText": "When on, every flagged post is reported so it surfaces in your normal modqueue.",
+        "defaultValue": true
+      },
+      "lookbackDays": {
+        "type": "number",
+        "label": "Lookback window (days)",
+        "helpText": "How far back to compare against. Older fingerprints are pruned daily.",
+        "defaultValue": 90
+      }
+    }
+  },
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite build --watch"
+  },
+  "permissions": {
+    "reddit": {
+      "enable": true,
+      "scope": "moderator"
+    },
+    "redis": true,
+    "http": {
+      "enable": true,
+      "domains": [
+        "generativelanguage.googleapis.com",
+        "i.redd.it",
+        "preview.redd.it",
+        "external-preview.redd.it",
+        "i.imgur.com"
+      ]
+    }
+  },
+  "dev": {
+    "subreddit": "tesmoddapp_dev"
+  }
+}
