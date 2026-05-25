@@ -1,16 +1,24 @@
 import { reddit, redis, settings } from '@devvit/web/server';
 import type { Post } from '@devvit/web/server';
+import { isT3 } from '@devvit/shared-types/tid.js';
 import { describeImage, embedText } from './gemini';
 import { cosineSimilarity, similarityPercent } from './similarity';
 import {
+  clearEmbedRetry,
   deleteFingerprint,
   getFingerprint,
+  getFlag,
   isWhitelisted,
+  listEmbedRetryIds,
   listRecentFingerprintIds,
+  markEmbedRetry,
+  pruneEmbedRetryOlderThan,
   saveFingerprint,
   saveFlag,
   type Fingerprint,
 } from './fingerprint';
+
+const SWEEP_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 const IMAGE_EXT = /\.(jpg|jpeg|png|webp|gif)(\?.*)?$/i;
 const REDDIT_IMAGE_HOST =
@@ -74,10 +82,18 @@ export async function indexPost(
   try {
     embedding = await embedText(embedInput);
   } catch (err) {
+    // Queue for retry instead of silently dropping — an un-indexed post is
+    // invisible to repost detection forever otherwise. The maintenance sweep
+    // re-attempts these within the age cap.
     console.warn(
-      `[modpilot:repost] embed failed for ${input.postId} — skipping fingerprint`,
+      `[modpilot:repost] embed failed for ${input.postId} — queued for retry`,
       err
     );
+    try {
+      await markEmbedRetry(input.postId, input.createdAtMs);
+    } catch {
+      // best-effort; nothing else we can do
+    }
     return undefined;
   }
 
@@ -90,12 +106,18 @@ export async function indexPost(
     createdAt: input.createdAtMs,
   };
   await saveFingerprint(fp);
+  // Indexed successfully — drop any prior retry entry for this post.
+  try {
+    await clearEmbedRetry(input.postId);
+  } catch {
+    // ignore
+  }
   return fp;
 }
 
 export async function findBestMatch(
   fp: Fingerprint,
-  opts: { lookbackDays: number; threshold: number }
+  opts: { lookbackDays: number; threshold: number; maxCreatedAt?: number }
 ): Promise<MatchResult | undefined> {
   const cutoff = fp.createdAt - opts.lookbackDays * 86_400_000;
   const candidateIds = await listRecentFingerprintIds(cutoff, fp.postId);
@@ -104,6 +126,11 @@ export async function findBestMatch(
   for (const candidateId of candidateIds) {
     const candidate = await getFingerprint(candidateId);
     if (!candidate) continue;
+    // The "original" must predate the subject. Without this, a re-scan (where
+    // both posts are already indexed) could flag the older original as a repost
+    // of the newer copy. In the realtime path this is naturally true; enforcing
+    // it makes the invariant hold for the maintenance sweep too.
+    if (opts.maxCreatedAt !== undefined && candidate.createdAt >= opts.maxCreatedAt) continue;
     if (await isWhitelisted(fp.postId, candidateId)) continue;
 
     const cosine = cosineSimilarity(fp.embedding, candidate.embedding);
@@ -172,10 +199,23 @@ export async function processNewPost(
   const match = await findBestMatch(fp, {
     lookbackDays: cfg.lookbackDays,
     threshold: cfg.similarityThreshold,
+    maxCreatedAt: fp.createdAt,
   });
 
   if (!match) return undefined;
 
+  await applyMatch(post, match, cfg);
+  return match;
+}
+
+// Persist a flag and run the side-effects (auto-comment + report) for a confirmed
+// match. Shared by the realtime path and the maintenance sweep so behavior stays
+// identical regardless of which one catches the repost.
+async function applyMatch(
+  post: Post,
+  match: MatchResult,
+  cfg: RepostSettings
+): Promise<void> {
   await saveFlag({
     postId: post.id,
     originalPostId: match.originalPostId,
@@ -214,8 +254,74 @@ export async function processNewPost(
       console.warn(`[modpilot:repost] report failed for ${post.id}`, err);
     }
   }
+}
 
-  return match;
+// Maintenance sweep (#1): re-evaluate posts created in the last 24h that aren't
+// yet flagged, matching each against the FULL lookback window. Catches reposts
+// missed by the realtime race (two near-simultaneous posts whose embeds overlap,
+// so neither saw the other in the index). Cheap: cosine over stored embeddings;
+// fetches a post from Reddit only when a match is actually found.
+export async function resweepRecent(): Promise<{ scanned: number; flagged: number }> {
+  const cfg = await loadSettings();
+  const since = Date.now() - SWEEP_WINDOW_MS;
+  const ids = await listRecentFingerprintIds(since, '');
+
+  let scanned = 0;
+  let flagged = 0;
+  for (const postId of ids) {
+    if (!isT3(postId)) continue;
+    if (await getFlag(postId)) continue; // already flagged — skip
+    const fp = await getFingerprint(postId);
+    if (!fp) continue;
+    scanned++;
+
+    const match = await findBestMatch(fp, {
+      lookbackDays: cfg.lookbackDays,
+      threshold: cfg.similarityThreshold,
+      maxCreatedAt: fp.createdAt,
+    });
+    if (!match) continue;
+
+    try {
+      const post = await reddit.getPostById(postId);
+      if (post.removed || post.spam) continue;
+      await applyMatch(post, match, cfg);
+      flagged++;
+      console.log(
+        `[modpilot:repost] resweep flagged ${postId} -> ${match.originalPostId} @ ${match.combined.toFixed(1)}%`
+      );
+    } catch (err) {
+      console.warn(`[modpilot:repost] resweep flag failed for ${postId}`, err);
+    }
+  }
+  return { scanned, flagged };
+}
+
+// Embed retry (#4): re-attempt posts whose embedding failed at index time, then
+// prune anything older than the 24h cap (too stale to bother). indexPost clears a
+// post from the retry set on success and re-queues it on repeated failure.
+export async function retryFailedEmbeds(): Promise<{ retried: number; pruned: number }> {
+  const since = Date.now() - SWEEP_WINDOW_MS;
+  const pruned = await pruneEmbedRetryOlderThan(since);
+  const ids = await listEmbedRetryIds(since);
+
+  for (const postId of ids) {
+    if (!isT3(postId)) {
+      await clearEmbedRetry(postId);
+      continue;
+    }
+    try {
+      const post = await reddit.getPostById(postId);
+      if (post.removed || post.spam) {
+        await clearEmbedRetry(postId);
+        continue;
+      }
+      await processNewPost(post); // re-embeds + indexes + flags; clears retry on success
+    } catch (err) {
+      console.warn(`[modpilot:repost] embed retry failed for ${postId}`, err);
+    }
+  }
+  return { retried: ids.length, pruned };
 }
 
 export async function dropPost(postId: string): Promise<void> {

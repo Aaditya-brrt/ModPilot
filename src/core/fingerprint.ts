@@ -26,6 +26,9 @@ export type Flag = {
 
 const FP_KEY = (postId: string) => `fp:${postId}`;
 const FP_INDEX = 'fp:index';
+// Posts whose embedding failed at index time. Scored by post createdAt (ms) so a
+// maintenance sweep can retry recent ones and prune anything past its age cap.
+const FP_RETRY = 'fp:retry';
 const FLAG_KEY = (postId: string) => `flag:${postId}`;
 const FLAG_QUEUE = 'flag:queue';
 const WHITELIST_KEY = (a: string, b: string) => {
@@ -84,6 +87,30 @@ export async function pruneOlderThan(cutoffMs: number): Promise<number> {
     await redis.del(FP_KEY(id));
   }
   await redis.zRem(FP_INDEX, ids);
+  return ids.length;
+}
+
+// Queue a post for embed retry (member = postId, score = post createdAt ms).
+// zAdd is idempotent — re-queuing keeps the same age, so the prune cap still fires.
+export async function markEmbedRetry(postId: string, createdAtMs: number): Promise<void> {
+  await redis.zAdd(FP_RETRY, { member: postId, score: createdAtMs });
+}
+
+export async function clearEmbedRetry(postId: string): Promise<void> {
+  await redis.zRem(FP_RETRY, [postId]);
+}
+
+// Post ids queued for retry that are newer than sinceMs (by post createdAt).
+export async function listEmbedRetryIds(sinceMs: number): Promise<string[]> {
+  const entries = await redis.zRange(FP_RETRY, sinceMs, '+inf', { by: 'score' });
+  return entries.map((e) => e.member);
+}
+
+// Drop retry entries older than cutoffMs (give up — too stale to bother). Returns count removed.
+export async function pruneEmbedRetryOlderThan(cutoffMs: number): Promise<number> {
+  const stale = await redis.zRange(FP_RETRY, '-inf', cutoffMs, { by: 'score' });
+  const ids = stale.map((s) => s.member);
+  if (ids.length) await redis.zRem(FP_RETRY, ids);
   return ids.length;
 }
 

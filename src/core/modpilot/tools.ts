@@ -40,6 +40,8 @@ function asBool(v: unknown, fallback = false): boolean {
   return typeof v === 'boolean' ? v : fallback;
 }
 
+// Full post detail — body, image description slot, report reasons. Heavy; only
+// emit this for single-item fetches (get_post) where the agent needs everything.
 function postSummary(p: Post) {
   return {
     id: p.id,
@@ -59,6 +61,28 @@ function postSummary(p: Post) {
     numberOfReports: p.numberOfReports,
     userReportReasons: p.userReportReasons,
     modReportReasons: p.modReportReasons,
+  };
+}
+
+// Compact post row for list/search results. Drops body, image description, url,
+// and report-reason arrays — the bulk of the per-post token cost. The agent
+// skims these to pick targets, then calls get_post for full detail on the few it
+// actually acts on (progressive disclosure). numberOfReports is kept as a single
+// number because it is cheap and drives triage.
+function thinPostRow(p: Post) {
+  return {
+    id: p.id,
+    title: p.title.slice(0, 200),
+    author: p.authorName,
+    score: p.score,
+    numComments: p.numberOfComments,
+    createdAt: p.createdAt.toISOString(),
+    permalink: p.permalink,
+    flair: p.flair?.text ?? '',
+    removed: p.removed,
+    locked: p.locked,
+    stickied: p.stickied,
+    numberOfReports: p.numberOfReports,
   };
 }
 
@@ -110,8 +134,10 @@ const search_posts: ToolDef = {
   category: 'read',
   description:
     'List recent posts in the current subreddit, with optional substring filters on title/body/author/flair. ' +
-    'Use this to find candidates before any mutation. Reddit has no true keyword search via Devvit, so this fetches recent posts and filters client-side — keep `limit` modest (default 50, max 200). ' +
-    'Example: search_posts({ sort: "new", limit: 100, query: "airdrop" }) returns recent posts mentioning "airdrop".',
+    'Use this to find candidates before any mutation. Reddit has no true keyword search via Devvit, so this fetches recent posts and filters them server-side, returning only matches. ' +
+    'Results are COMPACT rows (id, title, author, score, flair, counts, flags) — NOT the post body, image description, or report reasons. Call get_post on a specific id when you need full detail. ' +
+    'Keep `limit` modest (scan depth, default 50, max 200). ' +
+    'Example: search_posts({ sort: "new", limit: 100, query: "airdrop" }) returns compact rows for recent posts mentioning "airdrop".',
   parameters: {
     type: 'object',
     properties: {
@@ -143,7 +169,7 @@ const search_posts: ToolDef = {
     },
   },
   execute: async (args, ctx) => {
-    const sort = asString(args.sort, 'new');
+    const sort = asString(args.sort, 'new') === 'hot' ? 'hot' : 'new';
     const limit = Math.min(200, Math.max(1, asNumber(args.limit, 50)));
     const query = requireString(args, 'query')?.toLowerCase();
     const author = requireString(args, 'author')?.toLowerCase();
@@ -157,6 +183,7 @@ const search_posts: ToolDef = {
         : reddit.getNewPosts({ subredditName: ctx.subreddit, limit });
 
     const all = await listing.all();
+    // Filter server-side; only matches are returned to the model.
     const filtered = all.filter((p) => {
       if (minCreated && p.createdAt.getTime() < minCreated) return false;
       if (author && p.authorName.toLowerCase() !== author) return false;
@@ -171,12 +198,11 @@ const search_posts: ToolDef = {
       return true;
     });
 
-    const trimmed = filtered.slice(0, 50).map(postSummary);
-    await attachImageDescriptions(trimmed);
+    const rows = filtered.slice(0, 50).map(thinPostRow);
     return {
       ok: true,
-      summary: `Found ${filtered.length} matching post(s) (showing ${trimmed.length}).`,
-      data: { count: filtered.length, posts: trimmed },
+      summary: `Found ${filtered.length} matching post(s) (showing ${rows.length} compact rows — use get_post for full detail).`,
+      data: { count: filtered.length, posts: rows },
     };
   },
 };
@@ -291,9 +317,8 @@ const get_user_posts: ToolDef = {
     if (!username) return err('username required');
     const limit = Math.min(50, Math.max(1, asNumber(args.limit, 15)));
     const all = await reddit.getPostsByUser({ username, sort: 'new', limit }).all();
-    const trimmed = all.slice(0, limit).map(postSummary);
-    await attachImageDescriptions(trimmed);
-    return { ok: true, summary: `Fetched ${trimmed.length} posts by u/${username}.`, data: trimmed };
+    const rows = all.slice(0, limit).map(thinPostRow);
+    return { ok: true, summary: `Fetched ${rows.length} posts by u/${username}.`, data: rows };
   },
 };
 

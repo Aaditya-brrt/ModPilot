@@ -73,8 +73,13 @@ menu.post('/open-modpilot', async (c) => {
     const subreddit = await reddit.getCurrentSubreddit();
     const post = await reddit.submitCustomPost({
       subredditName: subreddit.name,
-      title: 'ModPilot — your AI mod copilot',
-      splash: { appDisplayName: 'ModPilot' },
+      title: 'ModPilot',
+      splash: {
+        appDisplayName: 'ModPilot',
+        heading: 'ModPilot',
+        description: 'Natural-language moderation copilot',
+        buttonLabel: 'Open ModPilot',
+      },
     });
     return c.json<UiResponse>(
       {

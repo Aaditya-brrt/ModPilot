@@ -1,4 +1,5 @@
 import { chatTurn } from './llm';
+import type { GeminiMessage } from './llm';
 import { executeTool, getFunctionDeclarations, getToolCategory } from './tools';
 import type { ToolContext } from './tools';
 import {
@@ -21,6 +22,16 @@ import { buildSystemPrompt } from './prompt';
 const MAX_TURNS = 8;
 const STREAM_CHUNK_SIZE = 12;
 const STREAM_CHUNK_DELAY_MS = 25;
+
+// History compaction (context Option 1): the full conversation is re-sent to
+// Gemini every turn, and old tool-result `data` payloads are the bulk of it. We
+// keep the most recent KEEP_RECENT_RESULTS tool results intact (the model is
+// actively reasoning over those) and strip the heavy `data` from older ones,
+// preserving `ok`/`summary`/`error` so the model still knows what each call did.
+// This is applied to a COPY just before sending — the stored history in Redis
+// stays full, so nothing is permanently lost and a re-load re-derives the same
+// compaction.
+const KEEP_RECENT_RESULTS = 6;
 
 type ToolCall = { name: string; args: Record<string, unknown> };
 type ExecOutcome = 'completed' | 'suspended';
@@ -51,6 +62,51 @@ function chunkText(s: string): string[] {
   }
   if (buf.length > 0) out.push(buf);
   return out;
+}
+
+// Return a send-ready copy of history with old tool-result `data` payloads
+// stripped (keeping the last KEEP_RECENT_RESULTS intact). Non-destructive: only
+// the messages/parts being stubbed are cloned; the input array is untouched.
+function compactHistoryForSend(history: GeminiMessage[]): {
+  messages: GeminiMessage[];
+  stubbed: number;
+} {
+  const out = history.slice();
+  let seenResults = 0;
+  let stubbed = 0;
+
+  for (let i = out.length - 1; i >= 0; i--) {
+    const msg = out[i]!;
+    let cloned: GeminiMessage | null = null;
+
+    for (let j = msg.parts.length - 1; j >= 0; j--) {
+      const part = msg.parts[j]!;
+      if (!('functionResponse' in part)) continue;
+
+      seenResults++;
+      if (seenResults <= KEEP_RECENT_RESULTS) continue;
+
+      const resp = part.functionResponse.response as Record<string, unknown>;
+      if (!resp || resp.data === undefined || resp.elided === true) continue;
+
+      if (!cloned) {
+        cloned = { role: msg.role, parts: msg.parts.slice() };
+        out[i] = cloned;
+      }
+      const stub: Record<string, unknown> = {
+        ok: resp.ok,
+        summary: resp.summary,
+        elided: true,
+      };
+      if (resp.error !== undefined) stub.error = resp.error;
+      cloned.parts[j] = {
+        functionResponse: { name: part.functionResponse.name, response: stub },
+      };
+      stubbed++;
+    }
+  }
+
+  return { messages: out, stubbed };
 }
 
 async function streamText(sessionId: string, text: string): Promise<void> {
@@ -187,8 +243,12 @@ async function driveLoop(sessionId: string, ctx: ToolContext, tag: string): Prom
     }
 
     const hist = await getHistory(sessionId);
-    console.log(`${tag} turn ${turn}/${MAX_TURNS} — history length ${hist.length}`);
-    const result = await chatTurn(hist, tools, systemPrompt, `${sessionId}#${turn}`);
+    const { messages: sendHist, stubbed } = compactHistoryForSend(hist);
+    console.log(
+      `${tag} turn ${turn}/${MAX_TURNS} — history length ${hist.length}` +
+        (stubbed > 0 ? ` (stubbed ${stubbed} old tool-result payload(s))` : '')
+    );
+    const result = await chatTurn(sendHist, tools, systemPrompt, `${sessionId}#${turn}`);
 
     // Mixed reply: text + calls. Stream the text, then run the calls.
     if (result.text && result.functionCalls.length > 0) {

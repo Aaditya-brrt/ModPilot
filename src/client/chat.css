@@ -21,6 +21,48 @@
   --content-max: 760px;
 }
 
+/* Light palette — applied on manual override (data-theme="light") OR when the
+   embedding context (Reddit / OS) reports a light preference and the user has
+   not forced dark. Accent stays the ModPilot orange. */
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #ffffff;
+  --panel: #f7f7f8;
+  --panel-2: #eeeef1;
+  --panel-3: #e3e3e8;
+  --border: #e2e2e7;
+  --border-strong: #cdcdd4;
+  --text: #18181b;
+  --text-dim: #52525b;
+  --text-faint: #8a8a93;
+  --accent: #ff4d1f;
+  --accent-soft: rgba(255, 77, 31, 0.12);
+  --accent-strong: #d63b12;
+  --good: #15803d;
+  --warn: #b45309;
+  --bad: #dc2626;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) {
+    color-scheme: light;
+    --bg: #ffffff;
+    --panel: #f7f7f8;
+    --panel-2: #eeeef1;
+    --panel-3: #e3e3e8;
+    --border: #e2e2e7;
+    --border-strong: #cdcdd4;
+    --text: #18181b;
+    --text-dim: #52525b;
+    --text-faint: #8a8a93;
+    --accent: #ff4d1f;
+    --accent-soft: rgba(255, 77, 31, 0.12);
+    --accent-strong: #d63b12;
+    --good: #15803d;
+    --warn: #b45309;
+    --bad: #dc2626;
+  }
+}
+
 * { box-sizing: border-box; }
 html, body {
   height: 100%;

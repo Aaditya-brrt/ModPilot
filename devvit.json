@@ -67,6 +67,10 @@
       "modpilot-repost-cleanup": {
         "endpoint": "/internal/jobs/cleanup",
         "cron": "0 3 * * *"
+      },
+      "modpilot-repost-resweep": {
+        "endpoint": "/internal/jobs/resweep",
+        "cron": "*/30 * * * *"
       }
     }
   },
