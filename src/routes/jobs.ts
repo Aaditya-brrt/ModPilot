@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { redis } from '@devvit/web/server';
-import { loadSettings, resweepRecent, retryFailedEmbeds } from '../core/repost';
+import { loadSettings, pruneStaleFlags, resweepRecent, retryFailedEmbeds } from '../core/repost';
 import { pruneOlderThan } from '../core/fingerprint';
 
 export const jobs = new Hono();
@@ -28,15 +28,20 @@ jobs.post('/resweep', async (c) => {
   try {
     const retry = await retryFailedEmbeds();
     const sweep = await resweepRecent();
+    // Drop flags whose post isn't in this subreddit anymore (deleted / foreign /
+    // leftover test data) so the agent stops trying to remove un-removable ghosts.
+    const stale = await pruneStaleFlags();
     await redis.hSet('modpilot:repost:last-resweep', {
       ts: String(Date.now()),
       retried: String(retry.retried),
       pruned: String(retry.pruned),
       scanned: String(sweep.scanned),
       flagged: String(sweep.flagged),
+      staleChecked: String(stale.checked),
+      stalePruned: String(stale.pruned),
     });
     console.log(
-      `[modpilot:repost] resweep: retried ${retry.retried} (pruned ${retry.pruned}), scanned ${sweep.scanned}, flagged ${sweep.flagged}`
+      `[modpilot:repost] resweep: retried ${retry.retried} (pruned ${retry.pruned}), scanned ${sweep.scanned}, flagged ${sweep.flagged}, stale-flags checked ${stale.checked} pruned ${stale.pruned}`
     );
   } catch (err) {
     console.error('[modpilot:repost] resweep job failed', err);

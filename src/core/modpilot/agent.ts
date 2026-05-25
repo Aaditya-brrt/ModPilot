@@ -5,12 +5,14 @@ import type { ToolContext } from './tools';
 import {
   appendMessage,
   bumpTurn,
+  clearInterrupt,
   clearPendingApproval,
   getApprovalMode,
   getHistory,
   getPendingApproval,
   getRunStatus,
   getSession,
+  isInterrupted,
   pushEvent,
   resetTurns,
   setPendingApproval,
@@ -19,7 +21,11 @@ import {
 } from './session';
 import { buildSystemPrompt } from './prompt';
 
-const MAX_TURNS = 8;
+// Not a workflow budget — a runaway circuit breaker. The moderator's stop button
+// is the real control now; this only exists so a model stuck in an infinite loop
+// can't burn unbounded Gemini cost if the moderator walks away. Set high enough
+// that no legitimate multi-step workflow ever reaches it.
+const HARD_TURN_CEILING = 200;
 const STREAM_CHUNK_SIZE = 12;
 const STREAM_CHUNK_DELAY_MS = 25;
 
@@ -32,6 +38,14 @@ const STREAM_CHUNK_DELAY_MS = 25;
 // stays full, so nothing is permanently lost and a re-load re-derives the same
 // compaction.
 const KEEP_RECENT_RESULTS = 6;
+
+// Hard cap on how many trailing messages we SEND to Gemini. The full history is
+// re-sent every turn, so a long-lived chat balloons the prompt — slow, costly,
+// and past a point the model starts parroting its own old replies instead of
+// acting. We send only the last MAX_SENT_MESSAGES, trimmed to a clean 'user'
+// boundary so we never ship a functionResponse whose functionCall was cut.
+// Redis history stays full; this only shrinks the per-turn payload.
+const MAX_SENT_MESSAGES = 60;
 
 type ToolCall = { name: string; args: Record<string, unknown> };
 type ExecOutcome = 'completed' | 'suspended';
@@ -49,6 +63,18 @@ function truncate(s: string, n: number): string {
   return s.slice(0, n) + '…';
 }
 
+// Heuristic for the no-op guard: does this text ANNOUNCE a mutation it intends to
+// make (future tense) while having emitted no tool calls? Past-tense summaries
+// ("Removed 5 posts") and plain answers don't match, so genuine final replies
+// pass through untouched.
+const PENDING_INTENT_RE =
+  /\b(i['’ ]?ll|i will|i am going to|i'?m going to|let me|going to|proceed to|now i)\b/i;
+const MUTATION_WORD_RE =
+  /\b(remov|ban\b|lock|delet|approv|report|repl(y|ies)|sticky|distinguish|mod[- ]?note|modmail)/i;
+function looksLikePendingAction(text: string): boolean {
+  return PENDING_INTENT_RE.test(text) && MUTATION_WORD_RE.test(text);
+}
+
 function chunkText(s: string): string[] {
   const out: string[] = [];
   const words = s.split(/(\s+)/);
@@ -64,14 +90,34 @@ function chunkText(s: string): string[] {
   return out;
 }
 
-// Return a send-ready copy of history with old tool-result `data` payloads
-// stripped (keeping the last KEEP_RECENT_RESULTS intact). Non-destructive: only
-// the messages/parts being stubbed are cloned; the input array is untouched.
+// Cap the SENT history to the last MAX_SENT_MESSAGES, starting on a clean 'user'
+// turn boundary so we never ship a functionResponse whose functionCall was
+// trimmed off the front (Gemini rejects an orphaned response). Non-destructive.
+function capHistory(history: GeminiMessage[]): GeminiMessage[] {
+  if (history.length <= MAX_SENT_MESSAGES) return history;
+  const cutoff = history.length - MAX_SENT_MESSAGES;
+  let start = cutoff;
+  while (start < history.length && history[start]!.role !== 'user') start++;
+  if (start >= history.length) {
+    // No user boundary in the tail — at least skip leading function responses so
+    // the window doesn't open on an orphaned functionResponse.
+    start = cutoff;
+    while (start < history.length && history[start]!.role === 'function') start++;
+  }
+  return history.slice(start);
+}
+
+// Return a send-ready copy: cap the message count, then strip old tool-result
+// `data` payloads (keeping the last KEEP_RECENT_RESULTS intact). Non-destructive:
+// only the messages/parts being stubbed are cloned; the input array is untouched.
 function compactHistoryForSend(history: GeminiMessage[]): {
   messages: GeminiMessage[];
   stubbed: number;
+  dropped: number;
 } {
-  const out = history.slice();
+  const capped = capHistory(history);
+  const dropped = history.length - capped.length;
+  const out = capped.slice();
   let seenResults = 0;
   let stubbed = 0;
 
@@ -106,7 +152,7 @@ function compactHistoryForSend(history: GeminiMessage[]): {
     }
   }
 
-  return { messages: out, stubbed };
+  return { messages: out, stubbed, dropped };
 }
 
 async function streamText(sessionId: string, text: string): Promise<void> {
@@ -152,6 +198,7 @@ export async function runAgent(args: { sessionId: string; userMessage: string })
 
   await setRunStatus(sessionId, 'running');
   await resetTurns(sessionId);
+  await clearInterrupt(sessionId); // drop any stale stop signal from a prior run
   console.log(
     `${tag} START | u/${meta.username} on r/${meta.subreddit} | mode=${meta.approvalMode} | msg: ${truncate(userMessage, 120)}`
   );
@@ -228,14 +275,25 @@ export async function resumeApproval(args: {
 async function driveLoop(sessionId: string, ctx: ToolContext, tag: string): Promise<void> {
   const systemPrompt = buildSystemPrompt(ctx);
   const tools = getFunctionDeclarations();
+  let noopNudges = 0; // no-op guard: at most one nudge per run, to avoid loops
 
   for (;;) {
+    // Cooperative stop: the moderator hit the stop button. Bail before spending
+    // another model turn. Latency is at most one in-flight turn.
+    if (await isInterrupted(sessionId)) {
+      await clearInterrupt(sessionId);
+      console.log(`${tag} STOP — interrupted by moderator`);
+      await pushEvent(sessionId, { type: 'stopped', ts: nowTs() });
+      await setRunStatus(sessionId, 'done');
+      return;
+    }
+
     const turn = await bumpTurn(sessionId);
-    if (turn > MAX_TURNS) {
-      console.warn(`${tag} STOP — hit MAX_TURNS=${MAX_TURNS}`);
+    if (turn > HARD_TURN_CEILING) {
+      console.warn(`${tag} STOP — hit HARD_TURN_CEILING=${HARD_TURN_CEILING} (runaway circuit breaker)`);
       await pushEvent(sessionId, {
         type: 'error',
-        message: `Stopped after ${MAX_TURNS} turns — possible loop. Ask the model to wrap up.`,
+        message: `Stopped after ${HARD_TURN_CEILING} turns — likely a loop. Use the stop button or rephrase.`,
         ts: nowTs(),
       });
       await setRunStatus(sessionId, 'error');
@@ -243,28 +301,19 @@ async function driveLoop(sessionId: string, ctx: ToolContext, tag: string): Prom
     }
 
     const hist = await getHistory(sessionId);
-    const { messages: sendHist, stubbed } = compactHistoryForSend(hist);
+    const { messages: sendHist, stubbed, dropped } = compactHistoryForSend(hist);
     console.log(
-      `${tag} turn ${turn}/${MAX_TURNS} — history length ${hist.length}` +
-        (stubbed > 0 ? ` (stubbed ${stubbed} old tool-result payload(s))` : '')
+      `${tag} turn ${turn}/${HARD_TURN_CEILING} — history ${hist.length} msgs` +
+        (dropped > 0 ? `, sent last ${hist.length - dropped} (capped ${dropped})` : '') +
+        (stubbed > 0 ? `, stubbed ${stubbed} old payload(s)` : '')
     );
     const result = await chatTurn(sendHist, tools, systemPrompt, `${sessionId}#${turn}`);
 
-    // Mixed reply: text + calls. Stream the text, then run the calls.
-    if (result.text && result.functionCalls.length > 0) {
-      await appendMessage(sessionId, {
-        role: 'model',
-        parts: [
-          { text: result.text },
-          ...result.functionCalls.map((fc) => ({ functionCall: { name: fc.name, args: fc.args } })),
-        ],
-      });
-      await streamText(sessionId, result.text);
-      const outcome = await executeCalls(sessionId, ctx, result.functionCalls, tag);
-      if (outcome === 'suspended') return;
-      continue;
-    }
-
+    // Any turn that makes tool calls: DROP the model's accompanying prose
+    // entirely — not streamed, not stored. "Act, don't narrate": the user sees
+    // tool actions as they run and exactly ONE summary, produced by the final
+    // pure-text turn below once all actions are done. Keeping only the
+    // functionCall parts also avoids re-feeding (and reinforcing) the narration.
     if (result.functionCalls.length > 0) {
       await appendMessage(sessionId, {
         role: 'model',
@@ -286,6 +335,28 @@ async function driveLoop(sessionId: string, ctx: ToolContext, tag: string): Prom
       });
       await setRunStatus(sessionId, 'error');
       return;
+    }
+
+    // No-op guard: the model described a mutation it intends to make but emitted
+    // no tool calls, so nothing happened. Don't finalize on that dead-end — nudge
+    // it once to actually issue the calls. Gated by intent phrasing (genuine
+    // answers pass through) and capped at one nudge per run (no infinite loop).
+    // The narration is NOT streamed to the user; only kept in history for context.
+    if (noopNudges < 1 && looksLikePendingAction(text)) {
+      noopNudges++;
+      console.warn(`${tag} turn ${turn} — no-op guard: described actions, no tool calls. Nudging.`);
+      await appendMessage(sessionId, { role: 'model', parts: [{ text }] });
+      await appendMessage(sessionId, {
+        role: 'user',
+        parts: [
+          {
+            text:
+              'You described actions you intend to take but issued NO tool calls, so nothing actually happened. ' +
+              'Issue the real tool calls now to perform them — do not describe them again.',
+          },
+        ],
+      });
+      continue;
     }
 
     console.log(`${tag} turn ${turn} — final text (${text.length} chars). Streaming.`);

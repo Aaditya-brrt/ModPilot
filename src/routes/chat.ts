@@ -2,13 +2,18 @@ import { Hono } from 'hono';
 import { reddit } from '@devvit/web/server';
 import { resumeApproval, runAgent } from '../core/modpilot/agent';
 import {
+  clearInterrupt,
+  clearPendingApproval,
   createSession,
   getEvents,
   getPendingApproval,
   getRunStatus,
   getSession,
   listSessions,
+  pushEvent,
   setApprovalMode,
+  setInterrupt,
+  setRunStatus,
 } from '../core/modpilot/session';
 
 export const chat = new Hono();
@@ -97,6 +102,29 @@ chat.get('/:sessionId/events', async (c) => {
   const { events, nextCursor } = await getEvents(sessionId, since);
   const status = await getRunStatus(sessionId);
   return c.json({ ok: true, events, nextCursor, status, mode: meta.approvalMode });
+});
+
+chat.post('/:sessionId/stop', async (c) => {
+  const auth = await requireMod();
+  if (!auth.ok) return c.json({ ok: false, error: auth.error }, 403);
+  const sessionId = c.req.param('sessionId');
+  const meta = await getSession(sessionId);
+  if (!meta) return c.json({ ok: false, error: 'session not found' }, 404);
+  if (meta.userId !== auth.userId) return c.json({ ok: false, error: 'not your session' }, 403);
+
+  const status = await getRunStatus(sessionId);
+  // Raise the cooperative stop flag — a running loop sees it between turns.
+  await setInterrupt(sessionId);
+
+  // If the run is suspended on an approval, no loop is alive to observe the flag.
+  // Tear it down directly so the UI unfreezes and the queued calls are dropped.
+  if (status === 'awaiting_approval') {
+    await clearPendingApproval(sessionId);
+    await clearInterrupt(sessionId);
+    await pushEvent(sessionId, { type: 'stopped', ts: Date.now() });
+    await setRunStatus(sessionId, 'done');
+  }
+  return c.json({ ok: true });
 });
 
 chat.post('/:sessionId/mode', async (c) => {

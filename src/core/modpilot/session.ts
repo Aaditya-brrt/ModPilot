@@ -25,6 +25,7 @@ export type ChatEvent =
   | { type: 'tool_approval_resolved'; id: string; decision: 'approve' | 'reject'; ts: number }
   | { type: 'text_chunk'; text: string; ts: number }
   | { type: 'assistant_done'; ts: number }
+  | { type: 'stopped'; ts: number }
   | { type: 'error'; message: string; ts: number };
 
 export type ApprovalMode = 'auto' | 'manual';
@@ -62,6 +63,10 @@ const SESSION_EVENT_COUNT = (sessionId: string) => `modpilot:session:${sessionId
 const SESSION_RUN = (sessionId: string) => `modpilot:session:${sessionId}:run`;
 const SESSION_PENDING = (sessionId: string) => `modpilot:session:${sessionId}:pending`;
 const SESSION_TURNS = (sessionId: string) => `modpilot:session:${sessionId}:turns`;
+// Cooperative stop signal. The moderator's stop button sets it; the agent loop
+// checks it between turns and bails. In Redis (not in-memory) because the stop
+// request and the running loop may land on different Devvit invocations.
+const SESSION_INTERRUPT = (sessionId: string) => `modpilot:session:${sessionId}:interrupt`;
 
 export async function createSession(args: {
   userId: string;
@@ -258,4 +263,18 @@ export async function resetTurns(sessionId: string): Promise<void> {
 
 export async function bumpTurn(sessionId: string): Promise<number> {
   return redis.incrBy(SESSION_TURNS(sessionId), 1);
+}
+
+// ---------- cooperative stop signal ----------
+
+export async function setInterrupt(sessionId: string): Promise<void> {
+  await redis.set(SESSION_INTERRUPT(sessionId), '1');
+}
+
+export async function isInterrupted(sessionId: string): Promise<boolean> {
+  return (await redis.get(SESSION_INTERRUPT(sessionId))) === '1';
+}
+
+export async function clearInterrupt(sessionId: string): Promise<void> {
+  await redis.del(SESSION_INTERRUPT(sessionId));
 }

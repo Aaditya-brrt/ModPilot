@@ -21,47 +21,7 @@
   --content-max: 760px;
 }
 
-/* Light palette — applied on manual override (data-theme="light") OR when the
-   embedding context (Reddit / OS) reports a light preference and the user has
-   not forced dark. Accent stays the ModPilot orange. */
-:root[data-theme='light'] {
-  color-scheme: light;
-  --bg: #ffffff;
-  --panel: #f7f7f8;
-  --panel-2: #eeeef1;
-  --panel-3: #e3e3e8;
-  --border: #e2e2e7;
-  --border-strong: #cdcdd4;
-  --text: #18181b;
-  --text-dim: #52525b;
-  --text-faint: #8a8a93;
-  --accent: #ff4d1f;
-  --accent-soft: rgba(255, 77, 31, 0.12);
-  --accent-strong: #d63b12;
-  --good: #15803d;
-  --warn: #b45309;
-  --bad: #dc2626;
-}
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme='dark']) {
-    color-scheme: light;
-    --bg: #ffffff;
-    --panel: #f7f7f8;
-    --panel-2: #eeeef1;
-    --panel-3: #e3e3e8;
-    --border: #e2e2e7;
-    --border-strong: #cdcdd4;
-    --text: #18181b;
-    --text-dim: #52525b;
-    --text-faint: #8a8a93;
-    --accent: #ff4d1f;
-    --accent-soft: rgba(255, 77, 31, 0.12);
-    --accent-strong: #d63b12;
-    --good: #15803d;
-    --warn: #b45309;
-    --bad: #dc2626;
-  }
-}
+/* Dark-only. No light palette, no toggle. */
 
 * { box-sizing: border-box; }
 html, body {
@@ -365,6 +325,14 @@ body {
   flex: 1;
   min-width: 0;
 }
+/* Chronological flow: text blocks + tool cards interleave in arrival order. */
+.msg-flow {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+.msg-flow > .msg-body { margin-bottom: 8px; }
+.msg-flow > .msg-body:last-child { margin-bottom: 0; }
 .msg-role {
   font-size: 11px;
   color: var(--text-faint);
@@ -607,6 +575,11 @@ body {
 }
 .composer .send:not(:disabled):hover { filter: brightness(1.1); }
 .composer .send:not(:disabled):active { transform: scale(0.96); }
+/* Running: same button becomes a stop control. */
+.composer .send.stop {
+  background: var(--bad);
+  color: #fff;
+}
 
 /* ---- composer foot: mode chip + hint ---- */
 .composer-foot {

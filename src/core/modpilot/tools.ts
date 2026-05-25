@@ -3,7 +3,7 @@ import type { Post, Comment } from '@devvit/web/server';
 import { isT1, isT3 } from '@devvit/shared-types/tid.js';
 import type { FunctionDeclaration } from './llm';
 import { exportFlagsForDashboard, processNewPost } from '../repost';
-import { getFingerprint } from '../fingerprint';
+import { getFingerprint, getFlag, setFlagStatus } from '../fingerprint';
 import { describeImage } from '../gemini';
 
 export type ToolCategory = 'read' | 'analyze' | 'mutate';
@@ -519,7 +519,7 @@ const remove_post: ToolDef = {
       confirmation: CONFIRM_PROP,
     },
   },
-  execute: async (args) => {
+  execute: async (args, ctx) => {
     const id = requireString(args, 'postId');
     const confirmation = requireString(args, 'confirmation');
     if (!id || !isT3(id)) return err('postId must be t3_...');
@@ -528,6 +528,16 @@ const remove_post: ToolDef = {
     try {
       const post = await reddit.getPostById(id);
       await post.remove(isSpam);
+      // If this post was a flagged repost, resolve the flag so it leaves the open
+      // queue — otherwise list_flagged_reposts keeps surfacing it after removal.
+      try {
+        const flag = await getFlag(id);
+        if (flag && flag.status === 'open') {
+          await setFlagStatus(id, 'confirmed', ctx.actor);
+        }
+      } catch {
+        // non-fatal — the removal already succeeded
+      }
       return {
         ok: true,
         summary: `Removed ${id}${isSpam ? ' as spam' : ''}.`,
@@ -552,7 +562,7 @@ const approve_post: ToolDef = {
       confirmation: CONFIRM_PROP,
     },
   },
-  execute: async (args) => {
+  execute: async (args, ctx) => {
     const id = requireString(args, 'postId');
     const confirmation = requireString(args, 'confirmation');
     if (!id || !isT3(id)) return err('postId must be t3_...');
@@ -560,6 +570,16 @@ const approve_post: ToolDef = {
     try {
       const post = await reddit.getPostById(id);
       await post.approve();
+      // Approving a flagged repost means the mod judged it NOT a repost — dismiss
+      // the flag so it leaves the open queue (list_flagged_reposts).
+      try {
+        const flag = await getFlag(id);
+        if (flag && flag.status === 'open') {
+          await setFlagStatus(id, 'dismissed', ctx.actor);
+        }
+      } catch {
+        // non-fatal — the approval already succeeded
+      }
       return { ok: true, summary: `Approved ${id}.`, data: { id, confirmation } };
     } catch (e) {
       return err(`approve_post failed: ${String(e)}`);

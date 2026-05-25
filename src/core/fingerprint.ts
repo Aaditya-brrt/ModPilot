@@ -5,7 +5,11 @@ export type Fingerprint = {
   postId: string;
   title: string;
   permalink: string;
+  // Text signal: vector of title + body. Always present.
   embedding: Float32Array;
+  // Image signal: vector of the vision description. Present only on image posts
+  // whose description embedded successfully. Absent on text-only posts.
+  imageEmbedding?: Float32Array;
   imageDescription: string;
   createdAt: number;
 };
@@ -41,6 +45,9 @@ export async function saveFingerprint(fp: Fingerprint): Promise<void> {
     title: fp.title,
     permalink: fp.permalink,
     embedding: encodeEmbedding(fp.embedding),
+    ...(fp.imageEmbedding
+      ? { imageEmbedding: encodeEmbedding(fp.imageEmbedding) }
+      : {}),
     imageDescription: fp.imageDescription,
     createdAt: String(fp.createdAt),
   });
@@ -57,6 +64,9 @@ export async function getFingerprint(
     title: h.title ?? '',
     permalink: h.permalink ?? '',
     embedding: decodeEmbedding(h.embedding),
+    ...(h.imageEmbedding
+      ? { imageEmbedding: decodeEmbedding(h.imageEmbedding) }
+      : {}),
     imageDescription: h.imageDescription ?? '',
     createdAt: Number(h.createdAt ?? 0),
   };
@@ -130,6 +140,12 @@ export async function saveFlag(flag: Flag): Promise<void> {
   } else {
     await redis.zRem(FLAG_QUEUE, [flag.postId]);
   }
+}
+
+// Remove a flag entirely: drop the hash and pull it from the open-flag queue.
+export async function deleteFlag(postId: string): Promise<void> {
+  await redis.del(FLAG_KEY(postId));
+  await redis.zRem(FLAG_QUEUE, [postId]);
 }
 
 export async function getFlag(postId: string): Promise<Flag | undefined> {

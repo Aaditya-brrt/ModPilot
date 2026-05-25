@@ -3,7 +3,12 @@ import { settings } from '@devvit/web/server';
 const EMBED_MODEL = 'gemini-embedding-2';
 const VISION_MODEL = 'gemini-2.5-flash';
 const EMBED_DIM = 768;
-const MAX_IMAGE_BYTES = 200_000;
+// Upper bound on image bytes we'll inline to Gemini vision. Gemini downscales /
+// tiles large images server-side for token cost, so we don't resize client-side
+// (that needs an image-decode dep that won't bundle for Devvit). 5MB covers
+// effectively all Reddit photos while keeping the base64 request body (~6.7MB)
+// well under the inline-data ceiling. Anything larger is skipped, not resized.
+const MAX_IMAGE_BYTES = 5_000_000;
 
 const baseUrl = 'https://generativelanguage.googleapis.com/v1beta';
 

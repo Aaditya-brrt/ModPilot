@@ -34,7 +34,7 @@ triggers.post('/on-post-create', async (c) => {
     const match = await processNewPost(post);
     if (match) {
       console.log(
-        `[modpilot:repost] flagged ${postId} -> ${match.originalPostId} @ ${match.combined.toFixed(1)}%`
+        `[modpilot:repost] flagged ${postId} -> ${match.originalPostId} @ ${match.combined.toFixed(1)}% (text ${match.textSim.toFixed(1)}%, image ${match.imageSim.toFixed(1)}%)`
       );
     }
   } catch (err) {

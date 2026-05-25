@@ -43,7 +43,7 @@ utility.
   `geminiApiKey`. Embedding spaces between `gemini-embedding-2` and the older
   `text-embedding-004` / `gemini-embedding-001` are **incompatible** — any
   old fingerprints in Redis must be cleared on model change.
-
+  
 ## Devvit primitives in use
 
 | Primitive | Where | Why |

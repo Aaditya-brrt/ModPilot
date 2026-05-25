@@ -6,15 +6,18 @@ import { cosineSimilarity, similarityPercent } from './similarity';
 import {
   clearEmbedRetry,
   deleteFingerprint,
+  deleteFlag,
   getFingerprint,
   getFlag,
   isWhitelisted,
   listEmbedRetryIds,
+  listFlagIds,
   listRecentFingerprintIds,
   markEmbedRetry,
   pruneEmbedRetryOlderThan,
   saveFingerprint,
   saveFlag,
+  setFlagStatus,
   type Fingerprint,
 } from './fingerprint';
 
@@ -53,15 +56,13 @@ function isLikelyImageUrl(url: string): boolean {
   return IMAGE_EXT.test(url);
 }
 
-function buildEmbedText(
-  title: string,
-  body: string,
-  imageDescription: string
-): string {
+// Text signal only — image content is embedded as its own vector so the two
+// signals stay independent (a same-image repost with a fresh title still scores
+// high on the image vector instead of being diluted into one blended vector).
+function buildTextEmbedInput(title: string, body: string): string {
   const parts: string[] = [];
   if (title) parts.push(`Title: ${title}`);
   if (body) parts.push(`Body: ${body.slice(0, 1500)}`);
-  if (imageDescription) parts.push(`Image: ${imageDescription}`);
   return parts.join('\n');
 }
 
@@ -77,16 +78,15 @@ export async function indexPost(
     }
   }
 
-  const embedInput = buildEmbedText(input.title, input.body, imageDescription);
+  // Text vector is mandatory. If it fails, the post is invisible to detection —
+  // queue for retry instead of silently dropping. The maintenance sweep
+  // re-attempts these within the age cap.
   let embedding: Float32Array;
   try {
-    embedding = await embedText(embedInput);
+    embedding = await embedText(buildTextEmbedInput(input.title, input.body));
   } catch (err) {
-    // Queue for retry instead of silently dropping — an un-indexed post is
-    // invisible to repost detection forever otherwise. The maintenance sweep
-    // re-attempts these within the age cap.
     console.warn(
-      `[modpilot:repost] embed failed for ${input.postId} — queued for retry`,
+      `[modpilot:repost] text embed failed for ${input.postId} — queued for retry`,
       err
     );
     try {
@@ -97,15 +97,33 @@ export async function indexPost(
     return undefined;
   }
 
+  // Image vector is optional. Failure here is non-fatal: index the post
+  // text-only rather than losing it. Text-only posts simply never get one.
+  let imageEmbedding: Float32Array | undefined;
+  if (imageDescription) {
+    try {
+      imageEmbedding = await embedText(imageDescription);
+    } catch (err) {
+      console.warn(
+        `[modpilot:repost] image embed failed for ${input.postId} — indexing text-only`,
+        err
+      );
+    }
+  }
+
   const fp: Fingerprint = {
     postId: input.postId,
     title: input.title,
     permalink: input.permalink,
     embedding,
+    ...(imageEmbedding ? { imageEmbedding } : {}),
     imageDescription,
     createdAt: input.createdAtMs,
   };
   await saveFingerprint(fp);
+  console.log(
+    `[modpilot:repost] indexed ${input.postId} — image vector ${imageEmbedding ? 'yes' : 'no'}`
+  );
   // Indexed successfully — drop any prior retry entry for this post.
   try {
     await clearEmbedRetry(input.postId);
@@ -115,41 +133,92 @@ export async function indexPost(
   return fp;
 }
 
+// Devvit Redis has no multi-hash read (mGet is string-values only; fingerprints
+// are hashes). The client is HTTP-backed, so concurrent calls parallelize —
+// load candidates in bounded chunks instead of one blocking round-trip each.
+// Turns N sequential RTTs into ceil(N / chunk). Bound concurrency so a 90-day
+// window doesn't fire thousands of requests at once.
+const FETCH_CHUNK = 50;
+
+async function loadFingerprintsConcurrently(
+  ids: string[]
+): Promise<Fingerprint[]> {
+  const out: Fingerprint[] = [];
+  for (let i = 0; i < ids.length; i += FETCH_CHUNK) {
+    const slice = ids.slice(i, i + FETCH_CHUNK);
+    const fetched = await Promise.all(slice.map((id) => getFingerprint(id)));
+    for (const candidate of fetched) {
+      if (candidate) out.push(candidate);
+    }
+  }
+  return out;
+}
+
 export async function findBestMatch(
   fp: Fingerprint,
   opts: { lookbackDays: number; threshold: number; maxCreatedAt?: number }
 ): Promise<MatchResult | undefined> {
   const cutoff = fp.createdAt - opts.lookbackDays * 86_400_000;
   const candidateIds = await listRecentFingerprintIds(cutoff, fp.postId);
+  const candidates = await loadFingerprintsConcurrently(candidateIds);
 
   let best: MatchResult | undefined;
-  for (const candidateId of candidateIds) {
-    const candidate = await getFingerprint(candidateId);
-    if (!candidate) continue;
+  // Diagnostics: how many we actually scored (after the date filter) and the
+  // single highest combined score seen — even below threshold, so logs reveal
+  // "near misses" for tuning similarityThreshold.
+  let compared = 0;
+  let topScore = 0;
+  for (const candidate of candidates) {
     // The "original" must predate the subject. Without this, a re-scan (where
     // both posts are already indexed) could flag the older original as a repost
     // of the newer copy. In the realtime path this is naturally true; enforcing
     // it makes the invariant hold for the maintenance sweep too.
     if (opts.maxCreatedAt !== undefined && candidate.createdAt >= opts.maxCreatedAt) continue;
-    if (await isWhitelisted(fp.postId, candidateId)) continue;
+    compared++;
 
-    const cosine = cosineSimilarity(fp.embedding, candidate.embedding);
-    const combined = similarityPercent(cosine);
+    const textSim = similarityPercent(
+      cosineSimilarity(fp.embedding, candidate.embedding)
+    );
+
+    // Real image similarity: compare image vectors only when BOTH posts have
+    // one. Text-only posts (no image vector on either side) score imageSim = 0
+    // and are decided purely on textSim.
+    let imageSim = 0;
+    if (fp.imageEmbedding && candidate.imageEmbedding) {
+      imageSim = similarityPercent(
+        cosineSimilarity(fp.imageEmbedding, candidate.imageEmbedding)
+      );
+    }
+
+    // Flag on the strongest single signal. A copied image with a fresh title
+    // (high imageSim, low textSim) and copied text on a new image (the reverse)
+    // both surface now; the old blended vector buried both.
+    const combined = Math.max(textSim, imageSim);
+    if (combined > topScore) topScore = combined;
     if (combined < opts.threshold) continue;
 
-    const imageSim =
-      fp.imageDescription && candidate.imageDescription ? combined : 0;
-
+    // Lazy whitelist: a per-candidate check was one Redis round-trip each. Only
+    // check when a candidate would actually become the best — at most once per
+    // improvement (~ln N expected), since "best" only advances through
+    // non-whitelisted candidates and every candidate that could beat it is checked.
     if (!best || combined > best.combined) {
+      if (await isWhitelisted(fp.postId, candidate.postId)) continue;
       best = {
-        originalPostId: candidateId,
-        textSim: combined,
+        originalPostId: candidate.postId,
+        textSim,
         imageSim,
         combined,
       };
     }
   }
 
+  console.log(
+    `[modpilot:repost] scan ${fp.postId}: ${compared}/${candidates.length} candidates, top ${topScore.toFixed(1)}%, ${
+      best
+        ? `match ${best.originalPostId} @ ${best.combined.toFixed(1)}%`
+        : 'no match'
+    }`
+  );
   return best;
 }
 
@@ -170,11 +239,13 @@ export async function loadSettings(): Promise<RepostSettings> {
 
 function buildAutoCommentBody(match: MatchResult, originalLink: string): string {
   const pct = match.combined.toFixed(1);
-  const imagePart =
-    match.imageSim > 0 ? `, image similarity ${match.imageSim.toFixed(1)}%` : '';
+  const detail =
+    match.imageSim > 0
+      ? ` (text ${match.textSim.toFixed(1)}%, image ${match.imageSim.toFixed(1)}%)`
+      : '';
   const disclaimer = '> *Automated by ModPilot repost detection. A moderator will review.*';
   return [
-    `**ModPilot** thinks this might be a repost (${pct}% similarity${imagePart}).`,
+    `**ModPilot** thinks this might be a repost (${pct}% similarity${detail}).`,
     '',
     `Possible original: ${originalLink}`,
     '',
@@ -288,7 +359,7 @@ export async function resweepRecent(): Promise<{ scanned: number; flagged: numbe
       await applyMatch(post, match, cfg);
       flagged++;
       console.log(
-        `[modpilot:repost] resweep flagged ${postId} -> ${match.originalPostId} @ ${match.combined.toFixed(1)}%`
+        `[modpilot:repost] resweep flagged ${postId} -> ${match.originalPostId} @ ${match.combined.toFixed(1)}% (text ${match.textSim.toFixed(1)}%, image ${match.imageSim.toFixed(1)}%)`
       );
     } catch (err) {
       console.warn(`[modpilot:repost] resweep flag failed for ${postId}`, err);
@@ -326,6 +397,59 @@ export async function retryFailedEmbeds(): Promise<{ retried: number; pruned: nu
 
 export async function dropPost(postId: string): Promise<void> {
   await deleteFingerprint(postId);
+}
+
+// Prune flags (and their fingerprints) whose post no longer belongs to THIS
+// subreddit: deleted posts, or leftover entries from earlier test installs in a
+// different sub. These are un-actionable — remove_post fails with "only allowed
+// inside the current subreddit", so the agent wastes turns trying to act on dead
+// IDs and list_flagged_reposts surfaces ghosts. Bounded to the open-flag queue
+// (what the agent actually sees). Runs in the maintenance sweep.
+export async function pruneStaleFlags(): Promise<{ checked: number; pruned: number }> {
+  let currentSubId: string;
+  try {
+    const sub = await reddit.getCurrentSubreddit();
+    currentSubId = sub.id;
+  } catch (err) {
+    console.warn('[modpilot:repost] pruneStaleFlags: cannot resolve current subreddit', err);
+    return { checked: 0, pruned: 0 };
+  }
+
+  const ids = await listFlagIds(500, true);
+  let checked = 0;
+  let pruned = 0;
+  for (const postId of ids) {
+    if (!isT3(postId)) {
+      await deleteFlag(postId);
+      pruned++;
+      continue;
+    }
+    checked++;
+    try {
+      const post = await reddit.getPostById(postId);
+      if (post.subredditId !== currentSubId) {
+        // Foreign sub → un-removable here. (getPostById succeeds for any post; the
+        // sub scope is only enforced on the mutation, so we check it ourselves.)
+        await deleteFlag(postId);
+        await deleteFingerprint(postId);
+        pruned++;
+        console.log(`[modpilot:repost] pruned stale flag ${postId} (not in current sub)`);
+      } else if (post.removed) {
+        // Already removed (by the agent, a mod, or out-of-band) → resolve so it
+        // leaves the open queue instead of lingering in list_flagged_reposts.
+        await setFlagStatus(postId, 'confirmed', 'system');
+        pruned++;
+        console.log(`[modpilot:repost] resolved flag ${postId} (post already removed)`);
+      }
+    } catch {
+      // Post gone / unfetchable → garbage, drop it entirely.
+      await deleteFlag(postId);
+      await deleteFingerprint(postId);
+      pruned++;
+      console.log(`[modpilot:repost] pruned stale flag ${postId} (post unfetchable)`);
+    }
+  }
+  return { checked, pruned };
 }
 
 export async function backfillRecent(

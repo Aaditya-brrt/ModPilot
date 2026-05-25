@@ -5,13 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>ModPilot</title>
     <link rel="stylesheet" href="./chat.css" />
-    <script>
-      // Apply saved theme before first paint to avoid a flash.
-      try {
-        var t = localStorage.getItem('modpilot-theme');
-        if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
-      } catch (e) {}
-    </script>
   </head>
   <body>
     <noscript style="display:block;padding:16px;background:#7f1d1d;color:#fff;font:13px sans-serif;">
@@ -48,7 +41,6 @@
           </button>
           <div class="topbar-title" id="topbar-title">New chat</div>
           <div class="topbar-status" id="topbar-status"></div>
-          <button class="icon-btn theme-toggle" id="theme-toggle" type="button" title="Toggle light / dark" aria-label="Toggle theme"></button>
         </header>
 
         <section class="pane chat-pane active" id="pane-chat">
