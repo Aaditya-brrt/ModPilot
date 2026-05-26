@@ -3,6 +3,7 @@ import type { UiResponse } from '@devvit/web/shared';
 import { context } from '@devvit/web/server';
 import { isT1, isT3 } from '@devvit/shared-types/tid.js';
 import { handleNuke, handleNukePost } from '../core/nuke';
+import { cleanupStaleData } from '../core/repost';
 
 type NukeFormValues = {
   remove?: boolean;
@@ -57,6 +58,24 @@ forms.post('/mop-comment-submit', async (c) => {
     },
     200
   );
+});
+
+forms.post('/clean-repost-data-submit', async (c) => {
+  await c.req.json().catch(() => ({})); // no fields; just drain the body
+  try {
+    const r = await cleanupStaleData();
+    return c.json<UiResponse>(
+      {
+        showToast:
+          `Cleaned up: ${r.flagsPruned} stale flag(s) of ${r.flagsChecked} checked, ` +
+          `${r.fingerprintsPruned} old fingerprint(s), ${r.retriesPruned} retry entr(ies).`,
+      },
+      200
+    );
+  } catch (err) {
+    console.error('[modpilot:repost] clean-repost-data failed', err);
+    return c.json<UiResponse>({ showToast: 'Cleanup failed. Check logs.' }, 200);
+  }
 });
 
 forms.post('/mop-post-submit', async (c) => {

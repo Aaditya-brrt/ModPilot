@@ -126,7 +126,7 @@ menu.post('/seed-test-posts', async (c) => {
     const plan: SeedItem[] = [];
 
     // ============ REPOST DETECTION ============
-    // Goal: exercise check_post_for_repost + list_flagged_reposts tools.
+    // Goal: exercise check_post_for_repost + repost reports surfacing in the modqueue.
     for (const p of uniqueImgs) {
       plan.push({ kind: 'link', title: p.title, url: p.url, category: 'image-original' });
     }
@@ -510,6 +510,28 @@ menu.post('/seed-test-posts', async (c) => {
       200
     );
   }
+});
+
+menu.post('/clean-repost-data', async (c) => {
+  await c.req.json<MenuItemRequest>();
+  return c.json<UiResponse>(
+    {
+      showForm: {
+        name: 'cleanRepostData',
+        form: {
+          fields: [],
+          title: 'Clean up repost data',
+          description:
+            'Reconciles flagged reposts against live Reddit (drops deleted/foreign ones, ' +
+            'resolves already-removed posts) and prunes fingerprints older than the lookback ' +
+            'window. Only stale/leftover data is removed — valid in-window data is kept.',
+          acceptLabel: 'Clean up',
+          cancelLabel: 'Cancel',
+        },
+      },
+    },
+    200
+  );
 });
 
 menu.post('/check-post', async (c) => {

@@ -50,6 +50,7 @@ export type FunctionDeclaration = {
 export type GeminiTurnResult = {
   text?: string;
   functionCalls: Array<{ name: string; args: Record<string, unknown> }>;
+  finishReason: string;
   raw: unknown;
 };
 
@@ -65,7 +66,7 @@ export async function chatTurn(
     systemInstruction: { parts: [{ text: systemInstruction }] },
     tools: tools.length > 0 ? [{ functionDeclarations: tools }] : undefined,
     toolConfig: tools.length > 0 ? { functionCallingConfig: { mode: 'AUTO' } } : undefined,
-    generationConfig: { temperature: 0.3, maxOutputTokens: 2048 },
+    generationConfig: { temperature: 0.3, maxOutputTokens: 8192 },
   };
 
   const roleSummary = history.map((m) => `${m.role}[${m.parts.length}p]`).join(' → ');
@@ -177,7 +178,7 @@ export async function chatTurn(
     console.log(`[modpilot:llm]   → text: ${textOut.slice(0, 400)}`);
   }
 
-  const out: GeminiTurnResult = { functionCalls, raw: json };
+  const out: GeminiTurnResult = { functionCalls, finishReason, raw: json };
   if (textOut) out.text = textOut;
   return out;
 }

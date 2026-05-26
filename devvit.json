@@ -38,6 +38,13 @@
         "endpoint": "/internal/menu/seed-test-posts"
       },
       {
+        "label": "Clean up repost data",
+        "description": "Remove stale/leftover repost data: reconcile flags against live Reddit and prune fingerprints older than the lookback window.",
+        "location": "subreddit",
+        "forUserType": "moderator",
+        "endpoint": "/internal/menu/clean-repost-data"
+      },
+      {
         "label": "Mop comments",
         "description": "Remove this comment and all child comments. This might take a few seconds to run.",
         "location": "comment",
@@ -55,7 +62,8 @@
   },
   "forms": {
     "mopComment": "/internal/form/mop-comment-submit",
-    "mopPost": "/internal/form/mop-post-submit"
+    "mopPost": "/internal/form/mop-post-submit",
+    "cleanRepostData": "/internal/form/clean-repost-data-submit"
   },
   "triggers": {
     "onAppInstall": "/internal/triggers/on-app-install",

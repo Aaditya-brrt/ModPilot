@@ -67,6 +67,11 @@ const SESSION_TURNS = (sessionId: string) => `modpilot:session:${sessionId}:turn
 // checks it between turns and bails. In Redis (not in-memory) because the stop
 // request and the running loop may land on different Devvit invocations.
 const SESSION_INTERRUPT = (sessionId: string) => `modpilot:session:${sessionId}:interrupt`;
+// One-preamble-per-message flag. The model's lead-in prose ("about to do X") is
+// surfaced only on the FIRST tool-bearing turn; this flag suppresses it on later
+// tool turns (no mid-loop narration). In Redis so it survives the approval
+// suspend/resume boundary, where driveLoop is re-entered on a fresh invocation.
+const SESSION_PREAMBLE = (sessionId: string) => `modpilot:session:${sessionId}:preamble`;
 
 export async function createSession(args: {
   userId: string;
@@ -277,4 +282,18 @@ export async function isInterrupted(sessionId: string): Promise<boolean> {
 
 export async function clearInterrupt(sessionId: string): Promise<void> {
   await redis.del(SESSION_INTERRUPT(sessionId));
+}
+
+// ---------- one-preamble-per-message flag ----------
+
+export async function markPreambleSent(sessionId: string): Promise<void> {
+  await redis.set(SESSION_PREAMBLE(sessionId), '1');
+}
+
+export async function wasPreambleSent(sessionId: string): Promise<boolean> {
+  return (await redis.get(SESSION_PREAMBLE(sessionId))) === '1';
+}
+
+export async function clearPreamble(sessionId: string): Promise<void> {
+  await redis.del(SESSION_PREAMBLE(sessionId));
 }

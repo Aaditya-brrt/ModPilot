@@ -1,4 +1,4 @@
-import { reddit, redis, settings } from '@devvit/web/server';
+import { context, reddit, settings } from '@devvit/web/server';
 import type { Post } from '@devvit/web/server';
 import { isT3 } from '@devvit/shared-types/tid.js';
 import { describeImage, embedText } from './gemini';
@@ -15,6 +15,7 @@ import {
   listRecentFingerprintIds,
   markEmbedRetry,
   pruneEmbedRetryOlderThan,
+  pruneOlderThan,
   saveFingerprint,
   saveFlag,
   setFlagStatus,
@@ -403,17 +404,34 @@ export async function dropPost(postId: string): Promise<void> {
 // subreddit: deleted posts, or leftover entries from earlier test installs in a
 // different sub. These are un-actionable — remove_post fails with "only allowed
 // inside the current subreddit", so the agent wastes turns trying to act on dead
-// IDs and list_flagged_reposts surfaces ghosts. Bounded to the open-flag queue
-// (what the agent actually sees). Runs in the maintenance sweep.
+// IDs and the modqueue surfaces ghosts. Bounded to the open-flag queue. Runs in
+// the maintenance sweep and the manual cleanup.
 export async function pruneStaleFlags(): Promise<{ checked: number; pruned: number }> {
-  let currentSubId: string;
+  // The sub a mutation is allowed in is the INSTALLATION sub (context.subredditId)
+  // — that's what post.remove() is scoped to and what the gRPC error reports. Use
+  // it as the "foreign" baseline; getCurrentSubreddit() can resolve a different sub
+  // in some contexts, which would let un-removable flags slip through. Fall back to
+  // getCurrentSubreddit().id when context.subredditId is absent (e.g. scheduler).
+  let ctxSubId: string | undefined;
   try {
-    const sub = await reddit.getCurrentSubreddit();
-    currentSubId = sub.id;
+    ctxSubId = context.subredditId;
+  } catch {
+    ctxSubId = undefined;
+  }
+  let getSubId = '';
+  try {
+    getSubId = (await reddit.getCurrentSubreddit()).id;
   } catch (err) {
-    console.warn('[modpilot:repost] pruneStaleFlags: cannot resolve current subreddit', err);
+    console.warn('[modpilot:repost] pruneStaleFlags: getCurrentSubreddit failed', err);
+  }
+  const currentSubId = ctxSubId || getSubId;
+  if (!currentSubId) {
+    console.warn('[modpilot:repost] pruneStaleFlags: cannot resolve current subreddit');
     return { checked: 0, pruned: 0 };
   }
+  console.log(
+    `[modpilot:repost] pruneStaleFlags: currentSubId=${currentSubId} (context.subredditId=${ctxSubId ?? 'n/a'}, getCurrentSubreddit=${getSubId || 'n/a'})`
+  );
 
   const ids = await listFlagIds(500, true);
   let checked = 0;
@@ -436,7 +454,7 @@ export async function pruneStaleFlags(): Promise<{ checked: number; pruned: numb
         console.log(`[modpilot:repost] pruned stale flag ${postId} (not in current sub)`);
       } else if (post.removed) {
         // Already removed (by the agent, a mod, or out-of-band) → resolve so it
-        // leaves the open queue instead of lingering in list_flagged_reposts.
+        // leaves the open flag queue instead of lingering as an open flag.
         await setFlagStatus(postId, 'confirmed', 'system');
         pruned++;
         console.log(`[modpilot:repost] resolved flag ${postId} (post already removed)`);
@@ -450,6 +468,34 @@ export async function pruneStaleFlags(): Promise<{ checked: number; pruned: numb
     }
   }
   return { checked, pruned };
+}
+
+// Manual stale-data cleanup (the "Clean up repost data" menu action). PURE
+// removal — never creates flags (unlike resweep/retry): reconcile open flags
+// against live Reddit state (foreign/gone → delete, already-removed → resolve),
+// then age-prune fingerprints and the embed-retry queue past the lookback window.
+// Same operations the cron jobs do, exposed as one on-demand sweep.
+export async function cleanupStaleData(): Promise<{
+  flagsChecked: number;
+  flagsPruned: number;
+  fingerprintsPruned: number;
+  retriesPruned: number;
+}> {
+  const cfg = await loadSettings();
+  const stale = await pruneStaleFlags();
+  const fingerprintsPruned = await pruneOlderThan(Date.now() - cfg.lookbackDays * 86_400_000);
+  // Retry entries are only useful for ~24h; anything older is abandoned.
+  const retriesPruned = await pruneEmbedRetryOlderThan(Date.now() - SWEEP_WINDOW_MS);
+  console.log(
+    `[modpilot:repost] cleanup: flags checked ${stale.checked} pruned ${stale.pruned}, ` +
+      `fingerprints pruned ${fingerprintsPruned}, retries pruned ${retriesPruned}`
+  );
+  return {
+    flagsChecked: stale.checked,
+    flagsPruned: stale.pruned,
+    fingerprintsPruned,
+    retriesPruned,
+  };
 }
 
 export async function backfillRecent(
@@ -480,51 +526,4 @@ export async function backfillRecent(
     }
   }
   return { indexed, failed };
-}
-
-export type DashboardFlag = {
-  postId: string;
-  originalPostId: string;
-  score: number;
-  textSim: number;
-  imageSim: number;
-  status: string;
-  createdAt: number;
-  subjectTitle: string;
-  subjectPermalink: string;
-  originalTitle: string;
-  originalPermalink: string;
-  imageDescription: string;
-};
-
-export async function exportFlagsForDashboard(
-  limit: number
-): Promise<DashboardFlag[]> {
-  const ids = await redis.zRange('flag:queue', 0, limit - 1, {
-    by: 'rank',
-    reverse: true,
-  });
-  const rows: DashboardFlag[] = [];
-  for (const entry of ids) {
-    const postId = entry.member;
-    const flagHash = await redis.hGetAll(`flag:${postId}`);
-    if (!flagHash || !flagHash.originalPostId) continue;
-    const originalFp = await getFingerprint(flagHash.originalPostId);
-    const subjectFp = await getFingerprint(postId);
-    rows.push({
-      postId,
-      originalPostId: flagHash.originalPostId,
-      score: Number(flagHash.score ?? 0),
-      textSim: Number(flagHash.textSim ?? 0),
-      imageSim: Number(flagHash.imageSim ?? 0),
-      status: flagHash.status ?? 'open',
-      createdAt: Number(flagHash.createdAt ?? 0),
-      subjectTitle: subjectFp?.title ?? '',
-      subjectPermalink: subjectFp?.permalink ?? '',
-      originalTitle: originalFp?.title ?? '',
-      originalPermalink: originalFp?.permalink ?? '',
-      imageDescription: subjectFp?.imageDescription ?? '',
-    });
-  }
-  return rows;
 }

@@ -1,10 +1,11 @@
-import { reddit } from '@devvit/web/server';
+import { context, reddit } from '@devvit/web/server';
 import type { Post, Comment } from '@devvit/web/server';
 import { isT1, isT3 } from '@devvit/shared-types/tid.js';
 import type { FunctionDeclaration } from './llm';
-import { exportFlagsForDashboard, processNewPost } from '../repost';
+import { processNewPost } from '../repost';
 import { getFingerprint, getFlag, setFlagStatus } from '../fingerprint';
-import { describeImage } from '../gemini';
+import { classifyPostsAgainstRules, describeImage } from '../gemini';
+import type { RuleVerdict } from '../gemini';
 
 export type ToolCategory = 'read' | 'analyze' | 'mutate';
 
@@ -38,6 +39,25 @@ function asNumber(v: unknown, fallback: number): number {
 }
 function asBool(v: unknown, fallback = false): boolean {
   return typeof v === 'boolean' ? v : fallback;
+}
+
+// Mutations are scoped by the Devvit runtime to the INSTALLATION's subreddit
+// (context.subredditId). A target in another sub — typically surfaced by a
+// cross-sub read like get_user_posts/get_user_comments, which return a user's
+// activity site-wide — fails with a cryptic gRPC error ("only allowed inside the
+// current subreddit: t5_..."). Catch it up front with a clear message so the
+// agent skips the doomed call instead of looking like the data is corrupt.
+// Returns an error string when foreign, or null when same-sub (or unknown).
+function foreignSubError(itemSubId: string): string | null {
+  const current = context.subredditId;
+  if (current && itemSubId && itemSubId !== current) {
+    return (
+      `Target is in subreddit ${itemSubId}, not the current one (${current}). ` +
+      'Moderation actions only work inside this community — this item belongs to a ' +
+      'different subreddit (likely surfaced by a cross-sub user-history read) and cannot be actioned here.'
+    );
+  }
+  return null;
 }
 
 // Full post detail — body, image description slot, report reasons. Heavy; only
@@ -120,6 +140,17 @@ function commentSummary(c: Comment) {
 
 function err(msg: string): ToolResult {
   return { ok: false, summary: msg, error: msg };
+}
+
+// Bare hostname of a post's url (external domain for link posts, reddit.com for
+// self-posts) — a cheap signal for link/self-promo rules, fed to the classifier.
+function urlDomain(u: string | undefined): string {
+  if (!u) return '';
+  try {
+    return new URL(u).hostname.replace(/^www\./, '');
+  } catch {
+    return '';
+  }
 }
 
 function requireString(args: Record<string, unknown>, name: string): string | undefined {
@@ -396,28 +427,6 @@ const get_modlog: ToolDef = {
   },
 };
 
-const list_flagged_reposts: ToolDef = {
-  name: 'list_flagged_reposts',
-  category: 'read',
-  description:
-    'List posts the repost detector has flagged as suspected reposts. Each row includes score, suspected original, and current status (open/confirmed/dismissed).',
-  parameters: {
-    type: 'object',
-    properties: {
-      limit: { type: 'number', description: 'Max flags (max 100). Default 25.' },
-    },
-  },
-  execute: async (args) => {
-    const limit = Math.min(100, Math.max(1, asNumber(args.limit, 25)));
-    const rows = await exportFlagsForDashboard(limit);
-    return {
-      ok: true,
-      summary: `Fetched ${rows.length} repost flag(s).`,
-      data: rows,
-    };
-  },
-};
-
 const describe_image: ToolDef = {
   name: 'describe_image',
   category: 'analyze',
@@ -492,6 +501,148 @@ const check_post_for_repost: ToolDef = {
   },
 };
 
+const scan_rule_violations: ToolDef = {
+  name: 'scan_rule_violations',
+  category: 'analyze',
+  description:
+    'Scan recent posts (or the modqueue) for subreddit-rule violations using the actual rule text. ' +
+    'Fetches the rules, then judges each post against ALL of them in batched model calls and returns only ' +
+    'clear violations (cited rule shortName + confidence + a short reason quoting the trigger). ' +
+    'Use this whenever the moderator asks to find, check, or flag rule-breaking posts — it is far cheaper than ' +
+    'fetching every post and judging them one by one. It does NOT remove or report anything: review the ' +
+    'returned violations, then call remove_post / reply_as_mod (or report) on the ones you and the moderator agree on.',
+  parameters: {
+    type: 'object',
+    properties: {
+      source: {
+        type: 'string',
+        enum: ['recent', 'modqueue'],
+        description: 'Where to pull posts from. "recent" = newest posts; "modqueue" = items awaiting review. Default "recent".',
+      },
+      limit: { type: 'number', description: 'Max posts to scan (max 50). Default 25.' },
+      maxAgeHours: {
+        type: 'number',
+        description:
+          'Optional: only scan posts created within this many hours (e.g. 72 = last 3 days). ' +
+          'Applies to source="recent". Default: scan the newest posts regardless of age.',
+      },
+      rule: {
+        type: 'string',
+        description: 'Optional: focus on a single rule by (substring of) its shortName. Default: check against all rules.',
+      },
+      minConfidence: {
+        type: 'number',
+        description: 'Only return violations at/above this confidence (0-100). Default 70.',
+      },
+    },
+  },
+  execute: async (args, ctx) => {
+    const source = args.source === 'modqueue' ? 'modqueue' : 'recent';
+    const limit = Math.min(50, Math.max(1, asNumber(args.limit, 25)));
+    const maxAgeHours = Math.max(0, asNumber(args.maxAgeHours, 0)); // 0 = no age filter
+    const minConfidence = Math.min(100, Math.max(0, asNumber(args.minConfidence, 70)));
+    const ruleFilter = requireString(args, 'rule');
+    try {
+      let rules = await reddit.getRules(ctx.subreddit);
+      if (ruleFilter) {
+        const f = ruleFilter.toLowerCase();
+        rules = rules.filter((r) => r.shortName.toLowerCase().includes(f));
+        if (rules.length === 0) {
+          return err(`No rule matching "${ruleFilter}". Call get_subreddit_rules to see exact names.`);
+        }
+      }
+      if (rules.length === 0) {
+        return { ok: true, summary: 'No rules configured for this subreddit.', data: { scanned: 0, violations: [] } };
+      }
+
+      // Gather candidate posts.
+      let posts: Post[];
+      if (source === 'modqueue') {
+        const sub = await reddit.getSubredditByName(ctx.subreddit);
+        const items = await sub.getModQueue({ type: 'post', limit }).all();
+        posts = items.filter((it): it is Post => 'title' in it).slice(0, limit);
+      } else {
+        // With an age window, fetch a wider page (up to 50) then filter by age, so
+        // a "last 3 days" scan isn't capped to the newest `limit` posts.
+        const fetchN = maxAgeHours > 0 ? 50 : limit;
+        const all = await reddit.getNewPosts({ subredditName: ctx.subreddit, limit: fetchN }).all();
+        let live = all.filter((p) => !p.removed && !p.spam);
+        if (maxAgeHours > 0) {
+          const cutoff = Date.now() - maxAgeHours * 3_600_000;
+          live = live.filter((p) => p.createdAt.getTime() >= cutoff);
+        }
+        posts = live.slice(0, maxAgeHours > 0 ? 50 : limit);
+      }
+      if (posts.length === 0) {
+        return {
+          ok: true,
+          summary:
+            maxAgeHours > 0
+              ? `No posts in the last ${maxAgeHours}h to scan.`
+              : `No ${source} posts to scan.`,
+          data: { scanned: 0, violations: [] },
+        };
+      }
+
+      // Attach image descriptions already computed at fingerprint time (free signal).
+      const descById = new Map<string, string>();
+      await Promise.all(
+        posts.map(async (p) => {
+          try {
+            const fp = await getFingerprint(p.id);
+            if (fp?.imageDescription) descById.set(p.id, fp.imageDescription);
+          } catch {
+            // ignore — empty stays
+          }
+        })
+      );
+
+      const rulesForClassify = rules.map((r) => ({ shortName: r.shortName, description: r.description }));
+      const byId = new Map<string, Post>(posts.map((p) => [p.id, p]));
+
+      // Batch the classification: one model call per ~10 posts, not per post.
+      const BATCH = 10;
+      const verdicts: RuleVerdict[] = [];
+      for (let i = 0; i < posts.length; i += BATCH) {
+        const slice = posts.slice(i, i + BATCH);
+        const rows = slice.map((p) => ({
+          postId: p.id,
+          title: p.title,
+          body: (p.body ?? '').slice(0, 500),
+          linkDomain: urlDomain(p.url),
+          imageDescription: descById.get(p.id) ?? '',
+        }));
+        const res = await classifyPostsAgainstRules(rulesForClassify, rows);
+        for (const v of res) verdicts.push(v);
+      }
+
+      const violations = verdicts
+        .filter((v) => v.violates && v.confidence >= minConfidence && byId.has(v.postId))
+        .map((v) => {
+          const p = byId.get(v.postId)!;
+          return {
+            postId: v.postId,
+            rule: v.rule,
+            confidence: v.confidence,
+            reason: v.reason,
+            title: p.title.slice(0, 140),
+            author: p.authorName,
+            permalink: p.permalink,
+          };
+        })
+        .sort((a, b) => b.confidence - a.confidence);
+
+      return {
+        ok: true,
+        summary: `Scanned ${posts.length} ${source} post(s); ${violations.length} likely violation(s) at ≥${minConfidence}% confidence.`,
+        data: { scanned: posts.length, source, violations },
+      };
+    } catch (e) {
+      return err(`scan_rule_violations failed: ${String(e)}`);
+    }
+  },
+};
+
 // ---------- MUTATION TOOLS ----------
 // All mutations require a `confirmation` field. The model must produce a sentence
 // stating exactly what it intends to do, naming the target. This forces the model
@@ -527,9 +678,11 @@ const remove_post: ToolDef = {
     const isSpam = asBool(args.isSpam, false);
     try {
       const post = await reddit.getPostById(id);
+      const foreign = foreignSubError(post.subredditId);
+      if (foreign) return err(foreign);
       await post.remove(isSpam);
       // If this post was a flagged repost, resolve the flag so it leaves the open
-      // queue — otherwise list_flagged_reposts keeps surfacing it after removal.
+      // queue (keeps the detection store consistent after the post is removed).
       try {
         const flag = await getFlag(id);
         if (flag && flag.status === 'open') {
@@ -569,9 +722,11 @@ const approve_post: ToolDef = {
     if (!confirmation) return err('confirmation required');
     try {
       const post = await reddit.getPostById(id);
+      const foreign = foreignSubError(post.subredditId);
+      if (foreign) return err(foreign);
       await post.approve();
       // Approving a flagged repost means the mod judged it NOT a repost — dismiss
-      // the flag so it leaves the open queue (list_flagged_reposts).
+      // the flag so it leaves the open queue (detection store stays consistent).
       try {
         const flag = await getFlag(id);
         if (flag && flag.status === 'open') {
@@ -607,6 +762,8 @@ const lock_post: ToolDef = {
     if (!confirmation) return err('confirmation required');
     try {
       const post = await reddit.getPostById(id);
+      const foreign = foreignSubError(post.subredditId);
+      if (foreign) return err(foreign);
       await post.lock();
       return { ok: true, summary: `Locked ${id}.`, data: { id, confirmation } };
     } catch (e) {
@@ -637,6 +794,8 @@ const remove_comment: ToolDef = {
     const isSpam = asBool(args.isSpam, false);
     try {
       const c = await reddit.getCommentById(id);
+      const foreign = foreignSubError(c.subredditId);
+      if (foreign) return err(foreign);
       await c.remove(isSpam);
       return { ok: true, summary: `Removed comment ${id}.`, data: { id, isSpam, confirmation } };
     } catch (e) {
@@ -1265,8 +1424,8 @@ export const TOOL_REGISTRY: Record<string, ToolDef> = {
   get_user_posts,
   get_user_comments,
   get_modlog,
-  list_flagged_reposts,
   check_post_for_repost,
+  scan_rule_violations,
   describe_image,
   get_subreddit_rules,
   get_modqueue,

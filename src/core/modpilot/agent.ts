@@ -7,17 +7,20 @@ import {
   bumpTurn,
   clearInterrupt,
   clearPendingApproval,
+  clearPreamble,
   getApprovalMode,
   getHistory,
   getPendingApproval,
   getRunStatus,
   getSession,
   isInterrupted,
+  markPreambleSent,
   pushEvent,
   resetTurns,
   setPendingApproval,
   setRunStatus,
   setSessionTitle,
+  wasPreambleSent,
 } from './session';
 import { buildSystemPrompt } from './prompt';
 
@@ -26,8 +29,6 @@ import { buildSystemPrompt } from './prompt';
 // can't burn unbounded Gemini cost if the moderator walks away. Set high enough
 // that no legitimate multi-step workflow ever reaches it.
 const HARD_TURN_CEILING = 200;
-const STREAM_CHUNK_SIZE = 12;
-const STREAM_CHUNK_DELAY_MS = 25;
 
 // History compaction (context Option 1): the full conversation is re-sent to
 // Gemini every turn, and old tool-result `data` payloads are the bulk of it. We
@@ -73,21 +74,6 @@ const MUTATION_WORD_RE =
   /\b(remov|ban\b|lock|delet|approv|report|repl(y|ies)|sticky|distinguish|mod[- ]?note|modmail)/i;
 function looksLikePendingAction(text: string): boolean {
   return PENDING_INTENT_RE.test(text) && MUTATION_WORD_RE.test(text);
-}
-
-function chunkText(s: string): string[] {
-  const out: string[] = [];
-  const words = s.split(/(\s+)/);
-  let buf = '';
-  for (const w of words) {
-    buf += w;
-    if (buf.length >= STREAM_CHUNK_SIZE) {
-      out.push(buf);
-      buf = '';
-    }
-  }
-  if (buf.length > 0) out.push(buf);
-  return out;
 }
 
 // Cap the SENT history to the last MAX_SENT_MESSAGES, starting on a clean 'user'
@@ -155,12 +141,12 @@ function compactHistoryForSend(history: GeminiMessage[]): {
   return { messages: out, stubbed, dropped };
 }
 
+// Deliver the final text in one event. Devvit's fetch is buffered (no real token
+// stream from Gemini) and the client polls rather than holding an SSE socket, so
+// faking cadence server-side is pointless — the CLIENT animates the reveal with a
+// requestAnimationFrame typewriter instead, which looks like real streaming.
 async function streamText(sessionId: string, text: string): Promise<void> {
-  const chunks = chunkText(text);
-  for (const chunk of chunks) {
-    await pushEvent(sessionId, { type: 'text_chunk', text: chunk, ts: nowTs() });
-    if (chunks.length > 1) await new Promise((r) => setTimeout(r, STREAM_CHUNK_DELAY_MS));
-  }
+  await pushEvent(sessionId, { type: 'text_chunk', text, ts: nowTs() });
 }
 
 // ---------- entry points ----------
@@ -199,6 +185,7 @@ export async function runAgent(args: { sessionId: string; userMessage: string })
   await setRunStatus(sessionId, 'running');
   await resetTurns(sessionId);
   await clearInterrupt(sessionId); // drop any stale stop signal from a prior run
+  await clearPreamble(sessionId); // re-arm the one lead-in line for this message
   console.log(
     `${tag} START | u/${meta.username} on r/${meta.subreddit} | mode=${meta.approvalMode} | msg: ${truncate(userMessage, 120)}`
   );
@@ -276,6 +263,7 @@ async function driveLoop(sessionId: string, ctx: ToolContext, tag: string): Prom
   const systemPrompt = buildSystemPrompt(ctx);
   const tools = getFunctionDeclarations();
   let noopNudges = 0; // no-op guard: at most one nudge per run, to avoid loops
+  let malformedRetries = 0; // MALFORMED_FUNCTION_CALL retries, bounded
 
   for (;;) {
     // Cooperative stop: the moderator hit the stop button. Bail before spending
@@ -309,16 +297,26 @@ async function driveLoop(sessionId: string, ctx: ToolContext, tag: string): Prom
     );
     const result = await chatTurn(sendHist, tools, systemPrompt, `${sessionId}#${turn}`);
 
-    // Any turn that makes tool calls: DROP the model's accompanying prose
-    // entirely — not streamed, not stored. "Act, don't narrate": the user sees
-    // tool actions as they run and exactly ONE summary, produced by the final
-    // pure-text turn below once all actions are done. Keeping only the
-    // functionCall parts also avoids re-feeding (and reinforcing) the narration.
+    // A turn that makes tool calls. The model's accompanying prose is a lead-in
+    // ("about to do X"): surface it ONCE — on the first tool-bearing turn of the
+    // message — so the moderator sees intent before actions fire. On every later
+    // tool turn the prose is DROPPED (not streamed, not stored): "act, don't
+    // narrate" — no mid-loop play-by-play. The final pure-text turn below writes
+    // the one closing summary once all actions are done.
     if (result.functionCalls.length > 0) {
-      await appendMessage(sessionId, {
-        role: 'model',
-        parts: result.functionCalls.map((fc) => ({ functionCall: { name: fc.name, args: fc.args } })),
-      });
+      const preface = (result.text ?? '').trim();
+      const showPreface = preface.length > 0 && !(await wasPreambleSent(sessionId));
+      const parts: GeminiMessage['parts'] = [];
+      if (showPreface) {
+        await markPreambleSent(sessionId);
+        console.log(`${tag} turn ${turn} — preamble (${preface.length} chars). Streaming.`);
+        await streamText(sessionId, preface);
+        parts.push({ text: preface }); // keep in history so the model won't re-lead-in
+      }
+      for (const fc of result.functionCalls) {
+        parts.push({ functionCall: { name: fc.name, args: fc.args } });
+      }
+      await appendMessage(sessionId, { role: 'model', parts });
       const outcome = await executeCalls(sessionId, ctx, result.functionCalls, tag);
       if (outcome === 'suspended') return;
       continue;
@@ -327,12 +325,31 @@ async function driveLoop(sessionId: string, ctx: ToolContext, tag: string): Prom
     // Pure text final reply.
     const text = result.text ?? '';
     if (!text) {
-      console.warn(`${tag} turn ${turn} — model returned NEITHER text NOR calls. Bailing.`);
-      await pushEvent(sessionId, {
-        type: 'error',
-        message: 'The model returned an empty response. Try rephrasing.',
-        ts: nowTs(),
-      });
+      // MALFORMED_FUNCTION_CALL: the model tried to call tools but produced output
+      // Gemini couldn't parse — usually from cramming too many calls into one turn.
+      // Retry (bounded) with a "fewer calls" nudge instead of dead-ending.
+      if (result.finishReason === 'MALFORMED_FUNCTION_CALL' && malformedRetries < 2) {
+        malformedRetries++;
+        console.warn(`${tag} turn ${turn} — MALFORMED_FUNCTION_CALL; retry ${malformedRetries}/2`);
+        await appendMessage(sessionId, {
+          role: 'user',
+          parts: [
+            {
+              text:
+                'Your previous tool call was malformed — likely too many calls at once. ' +
+                'Re-issue now with valid JSON arguments and AT MOST 8 tool calls this turn; ' +
+                'handle any remaining items on later turns.',
+            },
+          ],
+        });
+        continue;
+      }
+      const why =
+        result.finishReason === 'MALFORMED_FUNCTION_CALL'
+          ? 'The model kept producing a malformed tool call (often too many actions at once). Try a smaller batch or rephrase.'
+          : 'The model returned an empty response. Try rephrasing.';
+      console.warn(`${tag} turn ${turn} — empty result (finishReason=${result.finishReason}). Bailing.`);
+      await pushEvent(sessionId, { type: 'error', message: why, ts: nowTs() });
       await setRunStatus(sessionId, 'error');
       return;
     }
