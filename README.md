@@ -2,6 +2,10 @@
 
 A natural-language moderation copilot for Reddit, built on Devvit.
 
+<p align="center">
+  <img src="src/assets/readmeImage.png" alt="ModPilot chat UI" width="820">
+</p>
+
 ModPilot embeds a chat-style agent inside your subreddit. Mods describe what
 they want done in plain English ("show me reposts flagged in the last 24h",
 "audit u/foo's last 50 actions", "ban the user behind the spam wave and lock
