@@ -6,6 +6,7 @@ import { processNewPost } from '../repost';
 import { getFingerprint, getFlag, setFlagStatus } from '../fingerprint';
 import { classifyPostsAgainstRules, describeImage } from '../gemini';
 import type { RuleVerdict } from '../gemini';
+import { validateAutomodConfig } from '../automod/validate';
 
 export type ToolCategory = 'read' | 'analyze' | 'mutate';
 
@@ -1414,6 +1415,181 @@ const send_modmail: ToolDef = {
   },
 };
 
+// ---------- AUTOMOD CONFIG (verified Devvit wiki APIs) ----------
+// AutoModerator rules live in a wiki page at config/automoderator. The app's
+// bot account was added as a moderator with the `moderator` scope at install
+// (devvit.json permissions.reddit.scope), which covers wiki read/write — so
+// getWikiPage / updateWikiPage work without any extra grant. Every edit is
+// versioned by Reddit (getWikiPageRevisions / revertTo), so a bad write is
+// recoverable from the wiki history.
+const AUTOMOD_PAGE = 'config/automoderator';
+
+// AutoMod YAML forbids literal tabs for indentation — a single tab silently
+// breaks the whole config. Cheap structural guard before any write; the real
+// safety net is the moderator approving the full content in the gate.
+function automodSyntaxError(yaml: string): string | null {
+  if (!yaml.trim()) return 'config is empty — refusing to write a blank automod page';
+  if (/\t/.test(yaml)) return 'config contains tab characters — AutoMod requires spaces for indentation; replace tabs with spaces';
+  return null;
+}
+
+const get_automod_config: ToolDef = {
+  name: 'get_automod_config',
+  category: 'read',
+  description:
+    'Read the subreddit\'s AutoModerator configuration — the raw YAML rules at the config/automoderator wiki page that auto-remove/filter/approve/report content. ' +
+    'Use this to see what AutoMod already enforces BEFORE proposing a new rule (so you don\'t duplicate one), to explain in plain English what the current rules do, or to spot dead/conflicting rules. ' +
+    'Returns the full YAML plus the last revision date/author. If the subreddit has no AutoMod config yet, returns ok with an empty config note.',
+  parameters: { type: 'object', properties: {} },
+  execute: async (_args, ctx) => {
+    try {
+      const page = await reddit.getWikiPage(ctx.subreddit, AUTOMOD_PAGE);
+      const content = page.content ?? '';
+      return {
+        ok: true,
+        summary: `Fetched AutoMod config for r/${ctx.subreddit} (${content.split('\n').length} lines).`,
+        data: {
+          content,
+          lineCount: content.split('\n').length,
+          empty: content.trim().length === 0,
+          revisionDate: page.revisionDate?.toISOString?.() ?? null,
+          revisionAuthor: page.revisionAuthor?.username ?? null,
+          revisionReason: page.revisionReason ?? null,
+        },
+      };
+    } catch (e) {
+      // getWikiPage throws when the page doesn't exist (sub never set up AutoMod).
+      const msg = String(e);
+      if (/not found|404|does not exist|PAGE_NOT_CREATED|WIKI_DISABLED/i.test(msg)) {
+        return {
+          ok: true,
+          summary: `r/${ctx.subreddit} has no AutoMod config yet.`,
+          data: { content: '', lineCount: 0, empty: true, exists: false },
+        };
+      }
+      return err(`get_automod_config failed: ${msg}`);
+    }
+  },
+};
+
+const update_automod_config: ToolDef = {
+  name: 'update_automod_config',
+  category: 'mutate',
+  description:
+    'Write the subreddit\'s AutoModerator config (config/automoderator wiki page). This is HIGH-IMPACT: a bad write affects every future post/comment, so ALWAYS call get_automod_config first and pass a precise `confirmation`. ' +
+    'Two modes: pass `rule` to APPEND one new YAML rule block to the existing config (the safe default — preserves all current rules), or pass `content` to REPLACE the entire page (only when reworking the whole config; include every rule you want to keep). Pass exactly one of `rule` / `content`. ' +
+    'AutoMod YAML is indentation-sensitive and must use spaces, never tabs. The edit is versioned in the wiki history and can be reverted by hand if wrong.',
+  parameters: {
+    type: 'object',
+    required: ['confirmation'],
+    properties: {
+      rule: {
+        type: 'string',
+        description: 'A single AutoMod YAML rule block to append to the current config (preferred). Do NOT include a leading/trailing `---` separator — the tool inserts it.',
+      },
+      content: {
+        type: 'string',
+        description: 'The FULL replacement YAML for the entire page. Use only when rewriting the whole config; otherwise prefer `rule`.',
+      },
+      reason: { type: 'string', description: 'Short reason recorded in the wiki revision history.' },
+      confirmation: CONFIRM_PROP,
+    },
+  },
+  execute: async (args, ctx) => {
+    const rule = requireString(args, 'rule');
+    const content = requireString(args, 'content');
+    const confirmation = requireString(args, 'confirmation');
+    const reason = requireString(args, 'reason') || `ModPilot: AutoMod update by u/${ctx.actor}`;
+    if (!confirmation) return err('confirmation required');
+    if ((!rule && !content) || (rule && content)) {
+      return err('pass exactly one of `rule` (append) or `content` (full replace)');
+    }
+
+    // Read the current page so append mode preserves existing rules, and so we
+    // know whether to create vs update. Tolerate a missing page (new sub).
+    let current = '';
+    let exists = true;
+    try {
+      const page = await reddit.getWikiPage(ctx.subreddit, AUTOMOD_PAGE);
+      current = page.content ?? '';
+    } catch (e) {
+      const msg = String(e);
+      if (/not found|404|does not exist|PAGE_NOT_CREATED|WIKI_DISABLED/i.test(msg)) {
+        exists = false;
+      } else {
+        return err(`update_automod_config: could not read current config: ${msg}`);
+      }
+    }
+
+    let next: string;
+    if (rule) {
+      // The model often wraps the block in its own `---` separators despite the
+      // instruction not to; strip leading/trailing ones so we don't accumulate
+      // doubled/empty separators (harmless to AutoMod, but keeps the page clean).
+      const block = (rule as string).trim().replace(/^-{3,}\s*\n/, '').replace(/\n\s*-{3,}\s*$/, '').trim();
+      next = current.trim() ? `${current.trimEnd()}\n\n---\n\n${block}\n` : `${block}\n`;
+    } else {
+      next = (content as string).trimEnd() + '\n';
+    }
+
+    const syntax = automodSyntaxError(next);
+    if (syntax) return err(`update_automod_config rejected: ${syntax}`);
+
+    // Validate against the exact AutoMod schema BEFORE writing. Reddit validates
+    // server-side and rejects invalid YAML as an opaque HTTP 415, so we catch
+    // the syntax errors here and hand the model a precise message to fix — this
+    // keeps the bad rule from ever reaching Reddit and lets the agent self-
+    // correct within the loop.
+    const check = validateAutomodConfig(next);
+    if (!check.ok) {
+      return err(
+        `update_automod_config rejected — invalid AutoMod syntax (NOT written). Fix and retry:\n` +
+          check.errors.map((e) => `  • ${e}`).join('\n')
+      );
+    }
+
+    try {
+      if (exists) {
+        await reddit.updateWikiPage({ subredditName: ctx.subreddit, page: AUTOMOD_PAGE, content: next, reason });
+      } else {
+        await reddit.createWikiPage({ subredditName: ctx.subreddit, page: AUTOMOD_PAGE, content: next, reason });
+      }
+      return {
+        ok: true,
+        summary: rule
+          ? `Appended a rule to AutoMod config for r/${ctx.subreddit} (now ${next.split('\n').length} lines).`
+          : `Replaced AutoMod config for r/${ctx.subreddit} (${next.split('\n').length} lines).`,
+        data: {
+          mode: rule ? 'append' : 'replace',
+          lineCount: next.split('\n').length,
+          warnings: check.warnings.length ? check.warnings : undefined,
+          confirmation,
+        },
+      };
+    } catch (e) {
+      const msg = String(e);
+      // HTTP 415 / grpc status 2 here means Reddit's server-side AutoMod
+      // validator REJECTED the YAML as invalid — the bad config was NOT saved.
+      // The real validation message is swallowed by the transport (the error
+      // response's content-type isn't what the gRPC client expects -> 415), so
+      // tell the model exactly what to do: fix the syntax, don't retry verbatim.
+      if (/415|status 2|UNKNOWN|invalid|malformed/i.test(msg)) {
+        return err(
+          'update_automod_config rejected by Reddit: the AutoMod YAML failed server-side validation and was NOT saved (surfaced as HTTP 415). ' +
+            'This is a SYNTAX error in the rule, not a permission problem — valid rules save fine. ' +
+            'Common cause: an unsupported check. AutoMod has NO `(length)` or `(empty)` modifier and no title/body length check. ' +
+            'Use real checks only (e.g. `title+body (includes): [...]`, `domain: [...]`, `author: { post_karma: "< 50" }`). ' +
+            'Revise the YAML and try a different rule — do not resend the same one.'
+        );
+      }
+      if (/permission|forbidden|403|not allowed|unauthorized/i.test(msg)) {
+        return err(`update_automod_config failed: ModPilot lacks wiki permission on r/${ctx.subreddit} — grant the app the "Manage Wiki Pages" moderator permission. (${msg})`);
+      }
+      return err(`update_automod_config failed: ${msg}`);
+    }
+  },
+};
+
 // ---------- REGISTRY ----------
 
 export const TOOL_REGISTRY: Record<string, ToolDef> = {
@@ -1432,6 +1608,7 @@ export const TOOL_REGISTRY: Record<string, ToolDef> = {
   get_modmail,
   get_modmail_thread,
   get_mod_notes,
+  get_automod_config,
   remove_post,
   approve_post,
   lock_post,
@@ -1443,6 +1620,7 @@ export const TOOL_REGISTRY: Record<string, ToolDef> = {
   reply_modmail,
   send_modmail,
   reply_as_mod,
+  update_automod_config,
 };
 
 export function getFunctionDeclarations(): FunctionDeclaration[] {

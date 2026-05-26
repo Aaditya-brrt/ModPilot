@@ -32,6 +32,18 @@ in `gemini.ts`, JSON response mode), returning clear violations with cited rule
 + confidence + reason. It is read-only; the agent acts on results via the
 mutation tools under the approval gate.
 
+**AutoModerator integration** is the third capability. The agent can read the
+subreddit's AutoMod config (`get_automod_config` → `reddit.getWikiPage` on the
+`config/automoderator` wiki page) to explain or audit existing rules, and write
+it (`update_automod_config` → `reddit.updateWikiPage`, gated like any mutation):
+`rule` appends one YAML block, `content` replaces the whole page. Reddit
+validates the config server-side and rejects invalid YAML as an opaque HTTP 415,
+so every write is first checked locally against the exact AutoMod schema (ported
+from `reddit-archive/reddit` `r2/r2/lib/automoderator.py`) in `src/core/automod/`
+— invalid modifiers/actions are blocked with a precise message before the write,
+and the agent self-corrects within the loop. The app's `moderator` reddit scope
+already covers wiki read/write; no extra grant is needed.
+
 The original template's "Mop" bulk-comment tool is left intact as a secondary
 utility.
 
@@ -59,7 +71,7 @@ utility.
 
 | Primitive | Where | Why |
 |---|---|---|
-| `reddit` client | `@devvit/web/server` | Read posts, submit comments, report, ban, approve, modmail, mod-notes |
+| `reddit` client | `@devvit/web/server` | Read posts, submit comments, report, ban, approve, modmail, mod-notes, read/write wiki (AutoMod config) |
 | `redis` | `@devvit/web/server` | Session + event store, fingerprint store, flag store, whitelist set |
 | `scheduler` | `@devvit/web/server` | Daily fingerprint cleanup + 30-min resweep |
 | `settings` | `@devvit/web/server` | API key (secret), repost threshold, toggles |
@@ -80,12 +92,17 @@ src/
     fingerprint.ts    Redis fingerprint + flag + whitelist + retry store
     similarity.ts     Cosine sim + scoring helpers
     repost.ts         Repost pipeline: index → match → flag; resweep + cleanup
+    automod/
+      schema.ts       Exact AutoMod schema constants (from reddit's engine)
+      parse.ts        Multi-doc YAML → rule blocks; key/modifier decoding
+      validate.ts     Validate config vs schema (blocks invalid writes pre-415)
     modpilot/
       agent.ts        Agent loop (turn-ceiling + stop/interrupt), event streaming
       llm.ts          Gemini chat + function-calling wrapper
       prompt.ts       System prompt (rules: read-before-write, lead-in-then-act, etc.)
       session.ts      Redis session + event + interrupt + preamble store
-      tools.ts        Tool registry (read / analyze / mutate); 26 tools
+      tools.ts        Tool registry (read / analyze / mutate); 28 tools
+                      (incl. get_automod_config / update_automod_config)
   routes/
     api.ts            Web-view backend (health only)
     chat.ts           Chat endpoints + /whoami mod gate (all gated by requireMod)

@@ -2,9 +2,7 @@
 
 A natural-language moderation copilot for Reddit, built on Devvit.
 
-<p align="center">
-  <img src="src/assets/readmeImage.png" alt="ModPilot chat UI" width="820">
-</p>
+
 
 ModPilot embeds a chat-style agent inside your subreddit. Mods describe what
 they want done in plain English ("show me reposts flagged in the last 24h",
@@ -29,15 +27,16 @@ parallel, summarizes, and only mutates after you approve.
 1. **Agent loop** — `runAgent()` runs a Gemini 2.5 Flash chat session that calls
    tools until the request is done. There's no fixed turn limit (a high
    circuit-breaker guards against runaway loops); a **stop button** interrupts a
-   run at any time. The model sees 26 tools as JSON-schema function declarations
+   run at any time. The model sees 28 tools as JSON-schema function declarations
    and decides which to call. It writes one brief lead-in before its first
    action, then acts without narration and ends with a single summary. Long
    chats are compacted before each request — recent messages kept whole, older
    tool payloads stubbed.
 2. **Tools** — `read` (search_posts, get_post, get_user, get_modqueue,
-   get_modmail, get_mod_notes, get_subreddit_rules, …), `analyze`
-   (check_post_for_repost, scan_rule_violations, describe_image), `mutate`
-   (remove_post, ban_user, reply_as_mod, send_modmail, add_mod_note, …). Every
+   get_modmail, get_mod_notes, get_subreddit_rules, get_automod_config, …),
+   `analyze` (check_post_for_repost, scan_rule_violations, describe_image),
+   `mutate` (remove_post, ban_user, reply_as_mod, send_modmail, add_mod_note,
+   update_automod_config, …). Every
    mutation requires a `confirmation: string` describing exactly what it will do
    (grounding the model in fields it just read) and is blocked up front if the
    target isn't in the current subreddit. In manual mode each mutation is gated
@@ -56,14 +55,22 @@ parallel, summarizes, and only mutates after you approve.
    them in one model pass, returning only clear violations with the cited rule,
    a confidence score, and a short reason. It never mutates — the agent reviews
    the results and acts under the approval gate.
-5. **Web-view UI** — a dark, Cursor-style chat. Tool calls render inline and
+5. **AutoModerator integration** — the agent reads the subreddit's AutoMod
+   config (the `config/automoderator` wiki page) to explain or audit existing
+   rules, and writes it under the approval gate: append one YAML rule or replace
+   the whole page. Because Reddit validates the config server-side and rejects
+   bad YAML as an opaque HTTP 415, every proposed rule is first checked against
+   the **exact AutoMod schema** (ported from Reddit's own engine) — invalid
+   modifiers/actions are caught with a precise fix *before* the write, and the
+   agent self-corrects in-loop.
+6. **Web-view UI** — a dark, Cursor-style chat. Tool calls render inline and
    chronologically as expandable cards; the final reply types out via a
    client-side animation. The view polls `/api/chat/:id/events` every 250ms
    (single-flight). Switching chats shows a loading skeleton, and an in-memory
    per-session event cache makes revisits instant. The whole view is
    **moderators-only** — non-mods get a block screen, and every endpoint
    enforces it server-side.
-6. **Mop** — the template's bulk-comment-removal tool is still wired up under
+7. **Mop** — the template's bulk-comment-removal tool is still wired up under
    subreddit menu items.
 
 ## Features
@@ -79,6 +86,10 @@ parallel, summarizes, and only mutates after you approve.
   into the modqueue, with whitelist learning when mods mark a pair not-a-repost.
 - **Rule-violation scanning** — batched LLM classification of posts against your
   real subreddit rules, returning the cited rule + confidence + reason.
+- **AutoModerator integration** — read, explain, and write the subreddit's
+  AutoMod config in natural language; proposed rules are validated against the
+  exact AutoMod schema before saving, so invalid YAML is caught with a precise
+  fix instead of Reddit's silent rejection.
 - **Image vision** — Gemini Vision describes post images; cached in the
   fingerprint and reused by detection, scanning, and the agent.
 - **Mod notes & modmail** — read and write both via tools.
@@ -132,6 +143,7 @@ src/
     fingerprint.ts    Redis fingerprint + flag + whitelist store
     similarity.ts     Cosine sim + base64 vector encoding
     repost.ts         Repost pipeline: index → match → flag; sweep + cleanup
+    automod/          AutoMod config: schema + YAML parser + validator
     modpilot/
       agent.ts        Agent loop (turn-ceiling + stop), event streaming
       llm.ts          Gemini chat + function-calling wrapper
