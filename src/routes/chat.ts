@@ -33,6 +33,25 @@ async function requireMod(): Promise<{ ok: true; username: string; userId: strin
   }
 }
 
+// Lightweight identity/permission probe for the web-view to gate itself on load.
+// Unlike requireMod it never 403s — it just reports whether the caller is a mod,
+// so the client can show a clean "moderators only" screen instead of error toasts.
+chat.get('/whoami', async (c) => {
+  try {
+    const u = await reddit.getCurrentUser();
+    if (!u) return c.json({ ok: true, isMod: false, username: null });
+    const sub = await reddit.getCurrentSubreddit();
+    const mods = await reddit
+      .getModerators({ subredditName: sub.name, username: u.username, limit: 1 })
+      .all();
+    return c.json({ ok: true, isMod: mods.length > 0, username: u.username, subreddit: sub.name });
+  } catch (e) {
+    // Couldn't determine — report ok:false so the client fails open (the real
+    // enforcement is the 403s on every other endpoint).
+    return c.json({ ok: false, isMod: false, error: String(e) });
+  }
+});
+
 chat.post('/session', async (c) => {
   const auth = await requireMod();
   if (!auth.ok) return c.json({ ok: false, error: auth.error }, 403);

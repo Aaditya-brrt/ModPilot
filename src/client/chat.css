@@ -299,6 +299,18 @@ body {
 }
 .example:hover { border-color: var(--border-strong); color: var(--text); }
 
+/* ---- access gate (non-moderator block screen) ---- */
+.access-denied {
+  max-width: 440px;
+  margin: 72px auto;
+  text-align: center;
+  color: var(--text-dim);
+  padding: 0 16px;
+}
+.access-icon { font-size: 40px; margin-bottom: 14px; }
+.access-denied h2 { margin: 0 0 8px; color: var(--text); font-size: 20px; }
+.access-denied p { margin: 0; line-height: 1.55; font-size: 14px; }
+
 /* ---- loading skeleton (shown while a chat's history is fetched) ---- */
 .skeleton-wrap {
   padding-top: 8px;
