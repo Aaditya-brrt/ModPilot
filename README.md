@@ -22,41 +22,65 @@ parallel, summarizes, and only mutates after you approve.
 
 ## How it works
 
-1. **Agent loop** — `runAgent()` keeps a Gemini 2.5 Flash chat session with up
-   to 8 tool-calling turns. The model sees 26 tools as JSON-schema function
-   declarations and decides which to call.
+1. **Agent loop** — `runAgent()` runs a Gemini 2.5 Flash chat session that calls
+   tools until the request is done. There's no fixed turn limit (a high
+   circuit-breaker guards against runaway loops); a **stop button** interrupts a
+   run at any time. The model sees 26 tools as JSON-schema function declarations
+   and decides which to call. It writes one brief lead-in before its first
+   action, then acts without narration and ends with a single summary. Long
+   chats are compacted before each request — recent messages kept whole, older
+   tool payloads stubbed.
 2. **Tools** — `read` (search_posts, get_post, get_user, get_modqueue,
-   get_modmail_conversations, get_mod_notes, list_flagged_reposts, …),
-   `analyze` (check_post_for_repost, describe_image), `mutate` (remove_post,
-   ban_user, reply_as_mod, send_modmail, add_mod_note, …). Every mutation
-   tool requires a `confirmation: string` describing exactly what action it
-   will take, forcing the model to ground itself in fields it just read.
-3. **Repost detection** — `onPostCreate` fingerprints every new post (title +
-   body + a Gemini Vision description of any linked image), embeds it via
-   `gemini-embedding-2` (768-dim), and stores it in Redis. The pipeline
-   compares each new post against the rolling window; matches above threshold
-   are auto-commented and reported. The agent surfaces those flags through
-   `list_flagged_reposts` and `check_post_for_repost`.
-4. **Streaming UI** — the chat view polls `/api/chat/:id/events` every 250ms
-   with a single-flight lock. Events include `user_message`, `tool_call`,
-   `tool_result`, `text_chunk`, `assistant_done`, `error` — rendered as
-   bubbles, expandable tool cards, and a typed-out final response.
-5. **Mop** — the template's bulk-comment-removal tool is still wired up under
+   get_modmail, get_mod_notes, get_subreddit_rules, …), `analyze`
+   (check_post_for_repost, scan_rule_violations, describe_image), `mutate`
+   (remove_post, ban_user, reply_as_mod, send_modmail, add_mod_note, …). Every
+   mutation requires a `confirmation: string` describing exactly what it will do
+   (grounding the model in fields it just read) and is blocked up front if the
+   target isn't in the current subreddit. In manual mode each mutation is gated
+   by an approval UI; in auto mode they run unattended.
+3. **Repost detection** — `onPostCreate` fingerprints every new post into Redis:
+   title + body as one vector, a Gemini Vision description of any image as a
+   second, independent vector (both `gemini-embedding-2`, 768-dim). Each new
+   post is matched against the rolling window; matches above threshold are
+   auto-commented and **reported into the modqueue** with a reason like
+   `ModPilot repost 87% match with t3_…`. The agent finds them via
+   `get_modqueue`, or tests one post on demand with `check_post_for_repost`. A
+   periodic sweep retries failed embeds, re-scans recent posts, and prunes stale
+   flags.
+4. **Rule-violation scanning** — `scan_rule_violations` pulls the subreddit's
+   actual rules and batch-judges recent posts (or the modqueue) against all of
+   them in one model pass, returning only clear violations with the cited rule,
+   a confidence score, and a short reason. It never mutates — the agent reviews
+   the results and acts under the approval gate.
+5. **Web-view UI** — a dark, Cursor-style chat. Tool calls render inline and
+   chronologically as expandable cards; the final reply types out via a
+   client-side animation. The view polls `/api/chat/:id/events` every 250ms
+   (single-flight). Switching chats shows a loading skeleton, and an in-memory
+   per-session event cache makes revisits instant. The whole view is
+   **moderators-only** — non-mods get a block screen, and every endpoint
+   enforces it server-side.
+6. **Mop** — the template's bulk-comment-removal tool is still wired up under
    subreddit menu items.
 
 ## Features
 
 - **Natural-language moderation** — describe outcomes, not API calls.
-- **Read-before-write** — the system prompt + per-tool schemas force the
-  model to fetch a target before mutating it.
+- **Read-before-write** — the system prompt + per-tool schemas force the model
+  to fetch a target before mutating it; out-of-subreddit targets are rejected
+  up front with a clear message instead of a cryptic API error.
 - **Parallel reads** — independent reads in a turn run concurrently.
-- **Repost detection (built-in tool)** — multimodal (text + image), with
-  whitelist learning when mods mark a pair as not-a-repost.
-- **Image vision** — Gemini Vision describes post images; descriptions are
-  cached in the fingerprint and surfaced to the agent automatically.
-- **Mod notes** — read and write mod-notes per user via tools.
-- **Modmail** — list, read, reply, and send.
-- **Daily cleanup** — old fingerprints pruned automatically.
+- **Manual or auto approval** — gate every mutation, or run unattended; stop a
+  run at any time with the stop button.
+- **Repost detection** — multimodal (independent text + image vectors), flagged
+  into the modqueue, with whitelist learning when mods mark a pair not-a-repost.
+- **Rule-violation scanning** — batched LLM classification of posts against your
+  real subreddit rules, returning the cited rule + confidence + reason.
+- **Image vision** — Gemini Vision describes post images; cached in the
+  fingerprint and reused by detection, scanning, and the agent.
+- **Mod notes & modmail** — read and write both via tools.
+- **Maintenance** — daily fingerprint cleanup, a periodic resweep, and a manual
+  "Clean up repost data" menu action that reconciles stale flags.
+- **Moderators-only** — the chat is gated to mods, enforced server-side.
 - **Tunable** — repost threshold, lookback window, auto-comment, and
   auto-report are per-subreddit settings.
 
@@ -89,6 +113,7 @@ parallel, summarizes, and only mutates after you approve.
 | Open ModPilot | subreddit | mods |
 | Check this post for reposts | post | mods |
 | Seed test posts (dev only) | subreddit | mods |
+| Clean up repost data | subreddit | mods |
 | Mop comments | comment | mods |
 | Mop post comments | post | mods |
 
@@ -99,27 +124,27 @@ src/
   index.ts            Hono bootstrap, route mounting
   core/
     nuke.ts           Original Mop bulk-comment logic
-    gemini.ts         Gemini embedding + vision wrappers
+    gemini.ts         Gemini wrappers: embed, vision, rule classification
     fingerprint.ts    Redis fingerprint + flag + whitelist store
     similarity.ts     Cosine sim + base64 vector encoding
-    repost.ts         Repost-detection pipeline: index → match → flag
+    repost.ts         Repost pipeline: index → match → flag; sweep + cleanup
     modpilot/
-      agent.ts        Agent loop (max 8 turns), event streaming
+      agent.ts        Agent loop (turn-ceiling + stop), event streaming
       llm.ts          Gemini chat + function-calling wrapper
       prompt.ts       System prompt
-      session.ts      Redis session + event store
+      session.ts      Redis session + event + interrupt store
       tools.ts        Tool registry (read / analyze / mutate)
   routes/
     api.ts            Web-view backend (health)
-    chat.ts           Chat endpoints
-    forms.ts          Form submit handlers
+    chat.ts           Chat endpoints + moderators-only gate (whoami)
+    forms.ts          Form submit handlers (mop, clean-up)
     menu.ts           Menu actions
     triggers.ts       PostCreate / PostDelete / AppInstall
-    jobs.ts           Scheduled cleanup
+    jobs.ts           Scheduled cleanup + resweep
   client/
     chat.html         Chat UI shell
-    chat.css          Dark-theme styles
-    chat.js           Chat logic, single-flight polling
+    chat.css          Dark-only styles
+    chat.js           Chat logic: polling, typewriter, skeleton + cache
 ```
 
 ## Commands
@@ -139,12 +164,12 @@ npm run launch       # deploy + devvit publish
 2. Run **Seed test posts (dev only)** — populates spam, rule violations,
    reposts, modmail threads, mod notes.
 3. Open ModPilot. Try:
-   - "Show me everything in the modqueue right now."
+   - "Show me everything in the modqueue right now." (reposts surface here)
+   - "Scan the last 3 days for rule violations."
    - "Find new accounts that posted today and look like spam."
    - "Audit u/<seeder>'s last 50 actions. Anything off?"
-   - "Show me reposts flagged in the last 24h."
 4. Approve a mutation and watch the tool-call card go from pending → green
-   with a summary.
+   with a summary — or flip to auto mode and use the stop button to interrupt.
 
 ## Status
 
