@@ -1590,6 +1590,94 @@ const update_automod_config: ToolDef = {
   },
 };
 
+const create_subreddit_rule: ToolDef = {
+  name: 'create_subreddit_rule',
+  category: 'mutate',
+  description:
+    'Create a NEW official subreddit rule — the numbered rules shown in the sidebar and offered in the report dialog. ' +
+    'This is DIFFERENT from AutoMod: subreddit rules are human-readable policy; creating one does NOT auto-action anything (use update_automod_config for automatic enforcement). ' +
+    'Use this to put a policy on the books (e.g. "No reposts within 30 days"). ALWAYS call get_subreddit_rules first so you do not duplicate an existing rule. ' +
+    'shortName must be unique (<= 100 chars); description shows on the sidebar; kind sets scope (all / link / comment).',
+  parameters: {
+    type: 'object',
+    required: ['shortName', 'description', 'confirmation'],
+    properties: {
+      shortName: {
+        type: 'string',
+        description: 'Short, unique rule name shown as the rule title. Max 100 chars.',
+      },
+      description: {
+        type: 'string',
+        description: "Full rule text shown on the subreddit's sidebar.",
+      },
+      kind: {
+        type: 'string',
+        enum: ['all', 'link', 'comment'],
+        description: 'What the rule applies to: all content, link/posts only, or comments only. Default: all.',
+      },
+      violationReason: {
+        type: 'string',
+        description: 'Optional text shown in the report form when users report under this rule. Defaults to shortName.',
+      },
+      confirmation: CONFIRM_PROP,
+    },
+  },
+  execute: async (args, ctx) => {
+    const shortName = requireString(args, 'shortName');
+    const description = requireString(args, 'description');
+    const kindRaw = requireString(args, 'kind') || 'all';
+    const violationReason = requireString(args, 'violationReason');
+    const confirmation = requireString(args, 'confirmation');
+    if (!confirmation) return err('confirmation required');
+    if (!shortName) return err('shortName required');
+    if (!description) return err('description required');
+    const kind = kindRaw === 'link' || kindRaw === 'comment' ? kindRaw : 'all';
+
+    // Reddit requires shortName uniqueness and errors on a dup; pre-check for a
+    // clean message instead of an opaque API error.
+    try {
+      const existing = await reddit.getRules(ctx.subreddit);
+      if (
+        existing.some(
+          (r) => r.shortName.trim().toLowerCase() === shortName.trim().toLowerCase()
+        )
+      ) {
+        return err(
+          `a rule named "${shortName}" already exists — pick a different shortName (this tool only creates new rules).`
+        );
+      }
+    } catch {
+      // Couldn't list rules — proceed; createRule still rejects a duplicate.
+    }
+
+    try {
+      const opts: Parameters<typeof reddit.createRule>[1] = {
+        shortName: shortName.slice(0, 100),
+        description,
+        kind,
+      };
+      if (violationReason) opts.violationReason = violationReason;
+      await reddit.createRule(ctx.subreddit, opts);
+      return {
+        ok: true,
+        summary: `Created subreddit rule "${shortName}" (${kind}) on r/${ctx.subreddit}.`,
+        data: { shortName, kind, confirmation },
+      };
+    } catch (e) {
+      const msg = String(e);
+      if (/exist|duplicate|unique|taken/i.test(msg)) {
+        return err(`could not create rule — a rule with that name may already exist. (${msg})`);
+      }
+      if (/permission|forbidden|403|not allowed|unauthorized/i.test(msg)) {
+        return err(
+          `create_subreddit_rule failed: ModPilot lacks the "Manage Settings" moderator permission on r/${ctx.subreddit}. (${msg})`
+        );
+      }
+      return err(`create_subreddit_rule failed: ${msg}`);
+    }
+  },
+};
+
 // ---------- REGISTRY ----------
 
 export const TOOL_REGISTRY: Record<string, ToolDef> = {
@@ -1621,6 +1709,7 @@ export const TOOL_REGISTRY: Record<string, ToolDef> = {
   send_modmail,
   reply_as_mod,
   update_automod_config,
+  create_subreddit_rule,
 };
 
 export function getFunctionDeclarations(): FunctionDeclaration[] {

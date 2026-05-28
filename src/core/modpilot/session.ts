@@ -147,6 +147,24 @@ export async function listSessions(userId: string, limit = 20): Promise<SessionM
   return out;
 }
 
+// Delete a session and every Redis key it owns, and drop it from the user's
+// index. Ownership is enforced by the caller (route checks meta.userId).
+export async function deleteSession(userId: string, sessionId: string): Promise<void> {
+  await redis.del(
+    SESSION_META(sessionId),
+    SESSION_MSGS(sessionId),
+    SESSION_MSG_COUNT(sessionId),
+    SESSION_EVENTS(sessionId),
+    SESSION_EVENT_COUNT(sessionId),
+    SESSION_RUN(sessionId),
+    SESSION_PENDING(sessionId),
+    SESSION_TURNS(sessionId),
+    SESSION_INTERRUPT(sessionId),
+    SESSION_PREAMBLE(sessionId)
+  );
+  await redis.zRem(SESSIONS_INDEX(userId), [sessionId]);
+}
+
 export async function setSessionTitle(sessionId: string, title: string): Promise<void> {
   await redis.hSet(SESSION_META(sessionId), {
     title: title.slice(0, 80),

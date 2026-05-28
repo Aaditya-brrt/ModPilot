@@ -27,7 +27,7 @@ parallel, summarizes, and only mutates after you approve.
 1. **Agent loop** — `runAgent()` runs a Gemini 2.5 Flash chat session that calls
    tools until the request is done. There's no fixed turn limit (a high
    circuit-breaker guards against runaway loops); a **stop button** interrupts a
-   run at any time. The model sees 28 tools as JSON-schema function declarations
+   run at any time. The model sees 29 tools as JSON-schema function declarations
    and decides which to call. It writes one brief lead-in before its first
    action, then acts without narration and ends with a single summary. Long
    chats are compacted before each request — recent messages kept whole, older
@@ -36,7 +36,7 @@ parallel, summarizes, and only mutates after you approve.
    get_modmail, get_mod_notes, get_subreddit_rules, get_automod_config, …),
    `analyze` (check_post_for_repost, scan_rule_violations, describe_image),
    `mutate` (remove_post, ban_user, reply_as_mod, send_modmail, add_mod_note,
-   update_automod_config, …). Every
+   create_subreddit_rule, update_automod_config, …). Every
    mutation requires a `confirmation: string` describing exactly what it will do
    (grounding the model in fields it just read) and is blocked up front if the
    target isn't in the current subreddit. In manual mode each mutation is gated
@@ -145,7 +145,8 @@ src/
     repost.ts         Repost pipeline: index → match → flag; sweep + cleanup
     automod/          AutoMod config: schema + YAML parser + validator
     modpilot/
-      agent.ts        Agent loop (turn-ceiling + stop), event streaming
+      agent.ts        Agent loop (turn-ceiling + stop), event streaming;
+                      guards: no-op, malformed-call, don't-quit-on-failure
       llm.ts          Gemini chat + function-calling wrapper
       prompt.ts       System prompt
       session.ts      Redis session + event + interrupt store

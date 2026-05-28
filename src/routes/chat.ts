@@ -5,6 +5,7 @@ import {
   clearInterrupt,
   clearPendingApproval,
   createSession,
+  deleteSession,
   getEvents,
   getPendingApproval,
   getRunStatus,
@@ -76,6 +77,22 @@ chat.get('/sessions', async (c) => {
     return c.json({ ok: true, sessions });
   } catch (e) {
     return c.json({ ok: false, error: String(e), sessions: [] }, 500);
+  }
+});
+
+chat.delete('/:sessionId', async (c) => {
+  const auth = await requireMod();
+  if (!auth.ok) return c.json({ ok: false, error: auth.error }, 403);
+  const sessionId = c.req.param('sessionId');
+  const meta = await getSession(sessionId);
+  if (!meta) return c.json({ ok: true }); // already gone — treat as success
+  if (meta.userId !== auth.userId) return c.json({ ok: false, error: 'not your session' }, 403);
+  try {
+    await deleteSession(auth.userId, sessionId);
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('[modpilot] delete session failed', e);
+    return c.json({ ok: false, error: String(e) }, 500);
   }
 });
 

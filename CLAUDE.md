@@ -44,8 +44,20 @@ from `reddit-archive/reddit` `r2/r2/lib/automoderator.py`) in `src/core/automod/
 and the agent self-corrects within the loop. The app's `moderator` reddit scope
 already covers wiki read/write; no extra grant is needed.
 
+**Subreddit rules**: the agent reads the sidebar rules (`get_subreddit_rules`)
+and can create a new one (`create_subreddit_rule` → `reddit.createRule`, gated
+like any mutation, dup-name pre-checked). This is policy text only — distinct
+from AutoMod, which is the automatic-enforcement layer.
+
 The original template's "Mop" bulk-comment tool is left intact as a secondary
 utility.
+
+The `seed-test-posts` menu action populates a demo subreddit: posts (repost
+pairs, spam, rule-violators), threaded **comments** (incl. rule-violating ones —
+not pre-reported, so ModPilot itself flags them), subreddit rules, modqueue
+reports/filters, modmail threads, and mod notes. `open-modpilot` reuses one
+launcher post (id in Redis `modpilot:launcher-post`) instead of spamming new
+ones.
 
 ## Stack
 
@@ -97,12 +109,18 @@ src/
       parse.ts        Multi-doc YAML → rule blocks; key/modifier decoding
       validate.ts     Validate config vs schema (blocks invalid writes pre-415)
     modpilot/
-      agent.ts        Agent loop (turn-ceiling + stop/interrupt), event streaming
+      agent.ts        Agent loop (turn-ceiling + stop/interrupt), event streaming.
+                      Guards: no-op, malformed-call retry, don't-quit-on-failure
+                      (won't finalize while the last tool call is still failing;
+                      bounded retries, resets on success, skips mod rejections)
       llm.ts          Gemini chat + function-calling wrapper
-      prompt.ts       System prompt (rules: read-before-write, lead-in-then-act, etc.)
+      prompt.ts       System prompt (rules: read-before-write, lead-in-then-act,
+                      never-quit-on-failed-tool, etc.)
       session.ts      Redis session + event + interrupt + preamble store
-      tools.ts        Tool registry (read / analyze / mutate); 28 tools
-                      (incl. get_automod_config / update_automod_config)
+                      (deleteSession removes all keys + drops from user index)
+      tools.ts        Tool registry (read / analyze / mutate); 29 tools (incl.
+                      get_automod_config / update_automod_config /
+                      create_subreddit_rule)
   routes/
     api.ts            Web-view backend (health only)
     chat.ts           Chat endpoints + /whoami mod gate (all gated by requireMod)

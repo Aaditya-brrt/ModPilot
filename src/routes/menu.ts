@@ -1,8 +1,12 @@
 import { Hono } from 'hono';
 import type { MenuItemRequest, UiResponse } from '@devvit/web/shared';
 import type { FormField } from '@devvit/shared-types/shared/form.js';
-import { reddit } from '@devvit/web/server';
+import { reddit, redis } from '@devvit/web/server';
 import type { Post } from '@devvit/web/server';
+
+// Redis key holding the id of the live ModPilot launcher post, so repeated
+// "Open ModPilot" menu clicks reuse one post instead of spamming the feed.
+const LAUNCHER_POST_KEY = 'modpilot:launcher-post';
 
 export const menu = new Hono();
 
@@ -71,16 +75,34 @@ menu.post('/mop-post', async (c) => {
 menu.post('/open-modpilot', async (c) => {
   try {
     const subreddit = await reddit.getCurrentSubreddit();
+
+    // Reuse the existing launcher post if one is still live (not deleted/removed).
+    // Stale ids (post gone, deleted, or removed) fall through to creating a fresh one.
+    const existingId = await redis.get(LAUNCHER_POST_KEY);
+    if (existingId) {
+      try {
+        const existing = await reddit.getPostById(existingId as `t3_${string}`);
+        if (existing && !existing.removed && existing.removedByCategory !== 'deleted') {
+          return c.json<UiResponse>(
+            {
+              navigateTo: `https://www.reddit.com${existing.permalink}`,
+              showToast: 'Opening ModPilot…',
+            },
+            200
+          );
+        }
+      } catch {
+        // Couldn't fetch it (deleted/inaccessible) — drop the stale id and recreate.
+      }
+      await redis.del(LAUNCHER_POST_KEY);
+    }
+
     const post = await reddit.submitCustomPost({
       subredditName: subreddit.name,
       title: 'ModPilot',
-      splash: {
-        appDisplayName: 'ModPilot',
-        heading: 'ModPilot',
-        description: 'Natural-language moderation copilot',
-        buttonLabel: 'Open ModPilot',
-      },
+      splash: { appDisplayName: 'ModPilot' },
     });
+    await redis.set(LAUNCHER_POST_KEY, post.id);
     return c.json<UiResponse>(
       {
         navigateTo: `https://www.reddit.com${post.permalink}`,
@@ -410,6 +432,88 @@ menu.post('/seed-test-posts', async (c) => {
     }
     console.log(`[modpilot] posts filtered: ${filtered}`);
 
+    // ============ SEED COMMENT THREADS ============
+    // Real discussion under representative posts so the demo has comments to
+    // moderate — including rule-violating ones (spam / harassment / engagement
+    // bait). Nothing is pre-reported: ModPilot itself flags them via
+    // scan_rule_violations during the demo.
+    type SeedComment = { text: string; reply?: string };
+    const commentThreads: Array<{ category: string; comments: SeedComment[] }> = [
+      {
+        category: 'drama',
+        comments: [
+          {
+            text: 'Honestly this sub has been downhill since the mods went AWOL.',
+            reply: 'Hard disagree — the mods are the only reason it is still readable.',
+          },
+          {
+            text: 'lmao imagine caring this much about a subreddit, get a life you absolute clown',
+          },
+          { text: 'Can we keep it civil? Rule 1 exists for a reason.' },
+        ],
+      },
+      {
+        category: 'text-original',
+        comments: [
+          { text: 'Finally someone said it. I cancelled three services last month.' },
+          {
+            text: 'Check out my channel where I break down the best streaming deals: youtube.com/@notarealchannel-promo',
+          },
+          { text: 'The bundling is getting as bad as cable ever was.' },
+        ],
+      },
+      {
+        category: 'image-original',
+        comments: [
+          {
+            text: 'Pretty sure this exact image was posted last week — classic repost.',
+            reply: 'Yep, saw it on the front page a few days ago.',
+          },
+          { text: 'Source? This looks AI-upscaled.' },
+        ],
+      },
+      {
+        category: 'engagement-bait',
+        comments: [
+          { text: 'Commenting first for the luck!' },
+          { text: 'Upvoted — do mine next 🙏 follow for follow' },
+        ],
+      },
+      {
+        category: 'spam-crypto',
+        comments: [
+          { text: 'Is this legit?? 5 ETH sounds way too good to be true.' },
+          {
+            text: 'I verified my wallet and got nothing — this is a scam, do not click the link.',
+          },
+        ],
+      },
+    ];
+    let commentsAdded = 0;
+    for (const thread of commentThreads) {
+      const target = submittedByCategory[thread.category]?.[0];
+      if (!target) continue;
+      for (const cm of thread.comments) {
+        try {
+          const comment = await reddit.submitComment({ id: target.id, text: cm.text });
+          commentsAdded++;
+          if (cm.reply) {
+            try {
+              await reddit.submitComment({ id: comment.id, text: cm.reply });
+              commentsAdded++;
+              await new Promise((r) => setTimeout(r, 1500));
+            } catch (e) {
+              console.warn('[modpilot] comment reply failed', String(e).slice(0, 100));
+            }
+          }
+          await new Promise((r) => setTimeout(r, 1500));
+        } catch (e) {
+          console.warn(`[modpilot] comment failed (${thread.category}):`, String(e).slice(0, 100));
+        }
+      }
+    }
+    console.log(`[modpilot] comments added: ${commentsAdded}`);
+
     // ============ CREATE 3 INTERNAL MODMAIL THREADS ============
     const modmailThreads: Array<{ subject: string; body: string }> = [
       {
@@ -501,7 +605,7 @@ menu.post('/seed-test-posts', async (c) => {
     const msg =
       `Seeded ${created}/${plan.length} posts` +
       (failed > 0 ? ` (${failed} failed)` : '') +
-      ` · ${rulesAdded} rules · ${reportsFiled} reports · ${filtered} filtered · ${modmailsCreated} modmails · ${notesAdded} mod notes.`;
+      ` · ${commentsAdded} comments · ${rulesAdded} rules · ${reportsFiled} reports · ${filtered} filtered · ${modmailsCreated} modmails · ${notesAdded} mod notes.`;
     return c.json<UiResponse>({ showToast: msg.slice(0, 150) }, 200);
   } catch (err) {
     console.error('[modpilot] seed-test-posts failed', err);

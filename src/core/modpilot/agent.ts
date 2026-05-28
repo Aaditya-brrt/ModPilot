@@ -40,6 +40,14 @@ const HARD_TURN_CEILING = 200;
 // compaction.
 const KEEP_RECENT_RESULTS = 6;
 
+// Don't-quit-on-failure guard. When the model tries to end the run with a plain
+// text reply but its most recent tool call FAILED (ok:false), we refuse to
+// finalize and nudge it to re-evaluate and retry with a corrected call. Bounded
+// so a genuinely-unrecoverable failure can still be reported to the moderator
+// instead of looping forever. Resets to 0 after any successful tool call, so the
+// budget is per failure-streak, not per run.
+const MAX_FAILED_TOOL_RETRIES = 4;
+
 // Hard cap on how many trailing messages we SEND to Gemini. The full history is
 // re-sent every turn, so a long-lived chat balloons the prompt — slow, costly,
 // and past a point the model starts parroting its own old replies instead of
@@ -74,6 +82,31 @@ const MUTATION_WORD_RE =
   /\b(remov|ban\b|lock|delet|approv|report|repl(y|ies)|sticky|distinguish|mod[- ]?note|modmail)/i;
 function looksLikePendingAction(text: string): boolean {
   return PENDING_INTENT_RE.test(text) && MUTATION_WORD_RE.test(text);
+}
+
+// The outcome of the most recent tool call in history (the last functionResponse
+// part, scanning back). Used by the don't-quit-on-failure guard to decide whether
+// the model is bailing on a failed action.
+function lastToolOutcome(
+  history: GeminiMessage[]
+): { name: string; ok: boolean; error?: string | undefined; summary?: string | undefined } | undefined {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i]!;
+    if (msg.role !== 'function') continue;
+    for (let j = msg.parts.length - 1; j >= 0; j--) {
+      const part = msg.parts[j]!;
+      if ('functionResponse' in part) {
+        const resp = (part.functionResponse.response ?? {}) as Record<string, unknown>;
+        return {
+          name: part.functionResponse.name,
+          ok: resp.ok === true,
+          error: typeof resp.error === 'string' ? resp.error : undefined,
+          summary: typeof resp.summary === 'string' ? resp.summary : undefined,
+        };
+      }
+    }
+  }
+  return undefined;
 }
 
 // Cap the SENT history to the last MAX_SENT_MESSAGES, starting on a clean 'user'
@@ -264,6 +297,7 @@ async function driveLoop(sessionId: string, ctx: ToolContext, tag: string): Prom
   const tools = getFunctionDeclarations();
   let noopNudges = 0; // no-op guard: at most one nudge per run, to avoid loops
   let malformedRetries = 0; // MALFORMED_FUNCTION_CALL retries, bounded
+  let failedToolRetries = 0; // don't-quit-on-failure: retries since last success
 
   for (;;) {
     // Cooperative stop: the moderator hit the stop button. Bail before spending
@@ -289,6 +323,10 @@ async function driveLoop(sessionId: string, ctx: ToolContext, tag: string): Prom
     }
 
     const hist = await getHistory(sessionId);
+    // Reset the failure-retry budget once a tool has succeeded, so the guard
+    // gives a fresh set of retries to each new failure streak (not per run).
+    const lastTool = lastToolOutcome(hist);
+    if (lastTool?.ok) failedToolRetries = 0;
     const { messages: sendHist, stubbed, dropped } = compactHistoryForSend(hist);
     console.log(
       `${tag} turn ${turn}/${HARD_TURN_CEILING} — history ${hist.length} msgs` +
@@ -352,6 +390,44 @@ async function driveLoop(sessionId: string, ctx: ToolContext, tag: string): Prom
       await pushEvent(sessionId, { type: 'error', message: why, ts: nowTs() });
       await setRunStatus(sessionId, 'error');
       return;
+    }
+
+    // Don't-quit-on-failure guard: the model is finalizing with plain text, but
+    // its most recent tool call FAILED and wasn't a moderator rejection. Refuse
+    // to stop — nudge it to re-evaluate and issue a corrected call. Bounded by
+    // MAX_FAILED_TOOL_RETRIES (resets after any success) so a truly unrecoverable
+    // failure can still be reported rather than looping. The premature give-up
+    // text is kept in history for context but NOT streamed to the moderator.
+    if (
+      lastTool &&
+      !lastTool.ok &&
+      lastTool.error !== 'rejected_by_moderator' &&
+      failedToolRetries < MAX_FAILED_TOOL_RETRIES
+    ) {
+      failedToolRetries++;
+      console.warn(
+        `${tag} turn ${turn} — failure guard: ${lastTool.name} failed, model tried to stop. Nudge ${failedToolRetries}/${MAX_FAILED_TOOL_RETRIES}.`
+      );
+      await appendMessage(sessionId, { role: 'model', parts: [{ text }] });
+      const detail = lastTool.error
+        ? ` (${lastTool.error})`
+        : lastTool.summary
+          ? `: ${lastTool.summary}`
+          : '';
+      await appendMessage(sessionId, {
+        role: 'user',
+        parts: [
+          {
+            text:
+              `Your last action — \`${lastTool.name}\` — FAILED${detail}. Do NOT stop here. ` +
+              'Read the error carefully, rethink your approach, and issue a CORRECTED tool call now — ' +
+              'change the arguments or try a different tool/strategy; do not repeat the identical call that just failed. ' +
+              'Only give a final answer once the action has SUCCEEDED, or after you have genuinely exhausted every reasonable alternative ' +
+              '(in which case explain what you tried and why it could not be done).',
+          },
+        ],
+      });
+      continue;
     }
 
     // No-op guard: the model described a mutation it intends to make but emitted
